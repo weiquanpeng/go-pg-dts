@@ -488,7 +488,7 @@ func (s *Snapshotter) buildIntegerRangeQuery(chunk *Chunk, orderByClause string,
 	if chunk.hasRangeBounds() && len(pkColumns) == 1 {
 		pkColumn := pkColumns[0]
 		return fmt.Sprintf(
-			`SELECT * FROM %s."%s" WHERE %s >= %d AND %s <= %d ORDER BY %s LIMIT %d`,
+			`SELECT * FROM %s."%s" WHERE "%s" >= %d AND "%s" <= %d ORDER BY %s LIMIT %d`,
 			chunk.TableSchema,
 			chunk.TableName,
 			pkColumn,
@@ -990,7 +990,7 @@ func isIntegerType(dataType string) bool {
 
 func (s *Snapshotter) getPrimaryKeyBoundsWithConn(ctx context.Context, conn pq.Connection, table publication.Table, pkColumn string) (int64, int64, bool, error) {
 	query := fmt.Sprintf(`
-		SELECT MIN(%s)::bigint AS min_value, MAX(%s)::bigint AS max_value
+		SELECT MIN("%s")::bigint AS min_value, MAX("%s")::bigint AS max_value
 		FROM %s."%s"
 	`, pkColumn, pkColumn, table.Schema, table.Name)
 

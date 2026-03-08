@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/Trendyol/go-pq-cdc/pq"
 	"log"
 	"log/slog"
 	"os"
@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Trendyol/go-pq-cdc/pq"
 
 	cdc "github.com/Trendyol/go-pq-cdc"
 	"github.com/Trendyol/go-pq-cdc/config"
@@ -53,7 +55,7 @@ func main() {
 	flag.StringVar(&sourceDSN, "source", "", "源 PostgreSQL 连接 URL")
 	flag.StringVar(&targetDSN, "target", "", "目标 PostgreSQL 连接 URL")
 	flag.IntVar(&metricPort, "port", 8081, "metric server port")
-	flag.StringVar(&syncMode, "mode", "", "sync mode: full for all tables, empty for preset tables")
+	flag.StringVar(&syncMode, "mode", "all", "sync mode: full for all tables, empty for preset tables")
 	flag.BoolVar(&enableSnapshot, "snapshot", true, "enable snapshot: true/false")
 	flag.Parse()
 
@@ -101,7 +103,7 @@ func main() {
 		Snapshot: config.SnapshotConfig{
 			Enabled:           enableSnapshot,
 			Mode:              config.SnapshotModeInitial,
-			ChunkSize:         5000,
+			ChunkSize:         50000,
 			ClaimTimeout:      30 * time.Second,
 			HeartbeatInterval: 5 * time.Second,
 		},
@@ -125,7 +127,7 @@ func main() {
 		handleFullSyncMode(ctx, &cfg)
 	}
 
-	messages := make(chan Message, 10000)
+	messages := make(chan Message, 50000)
 	go Produce(ctx, targetPool, messages)
 
 	connector, err := cdc.NewConnector(ctx, cfg, FilteredMapper(messages))
@@ -203,7 +205,7 @@ func handleSnapshot(ctx *replication.ListenerContext, messages chan<- Message) {
 
 // Produce 从 messages 通道读取事件，批量写入目标库
 func Produce(ctx context.Context, w *pgxpool.Pool, messages <-chan Message) {
-	const bulkSize = 10000
+	const bulkSize = 50000
 	queue := make([]pendingItem, 0, bulkSize)
 
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -313,6 +315,38 @@ func buildSQL(ctx context.Context, conn *pgxpool.Pool, msg Message) (string, []i
 	}
 }
 
+var columnTypeCache = sync.Map{} // key: "schema.table" -> map[string]string
+
+// getColumnTypes 查询目标表的列名到数据类型的映射，并缓存
+func getColumnTypes(ctx context.Context, conn *pgxpool.Pool, table string) (map[string]string, error) {
+	if cached, ok := columnTypeCache.Load(table); ok {
+		return cached.(map[string]string), nil
+	}
+	schema, name := parseSchemaTable(table)
+	rows, err := conn.Query(ctx, `
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2
+    `, schema, name)
+	if err != nil {
+		return nil, fmt.Errorf("查询列类型失败: %w", err)
+	}
+	defer rows.Close()
+	colTypes := make(map[string]string)
+	for rows.Next() {
+		var col, typ string
+		if err := rows.Scan(&col, &typ); err != nil {
+			return nil, err
+		}
+		colTypes[col] = typ
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	columnTypeCache.Store(table, colTypes)
+	return colTypes, nil
+}
+
 // buildUpsertSQL 生成 INSERT ... ON CONFLICT ... DO UPDATE 语句
 func buildUpsertSQL(ctx context.Context, conn *pgxpool.Pool, table string, data map[string]interface{}) (string, []interface{}, error) {
 	pks, err := getPrimaryKeys(ctx, conn, table)
@@ -370,9 +404,32 @@ func buildUpsertSQL(ctx context.Context, conn *pgxpool.Pool, table string, data 
 	sql += strings.Join(sets, ", ")
 
 	// 参数
+	colTypes, err := getColumnTypes(ctx, conn, table)
+	if err != nil {
+		return "", nil, fmt.Errorf("获取目标表列类型失败: %w", err)
+	}
+
+	// 构建参数，对 JSON 列进行特殊处理
 	args := make([]interface{}, len(columns))
 	for i, col := range columns {
-		args[i] = data[col]
+		val := data[col]
+		typ := colTypes[col]
+		if typ == "json" || typ == "jsonb" {
+			if val == nil {
+				// 对于 NULL，传递 JSON 字符串 "null"
+				args[i] = "null"
+			} else {
+				// 使用 json.Marshal 将任意值（通常为字符串或 map）正确编码为 JSON 字符串
+				jsonBytes, err := json.Marshal(val)
+				if err != nil {
+					return "", nil, fmt.Errorf("序列化 JSON 列 %s 失败: %w", col, err)
+				}
+				args[i] = string(jsonBytes)
+			}
+		} else {
+			// 非 JSON 列，保持原值
+			args[i] = val
+		}
 	}
 	return sql, args, nil
 }
@@ -478,7 +535,7 @@ func handleFullSyncMode(ctx context.Context, cfg *config.Config) {
 		os.Exit(1)
 	}
 	defer conn.Close(ctx)
-	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name not in ('cdc_snapshot_job','cdc_snapshot_chunks','table_primary_keys');`
+	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name not in ('cdc_snapshot_job','cdc_snapshot_chunks','table_primary_keys','ConversationNew','ConversationSummary','JobEvent','PromptDisplayAssetVersionWorkflow','PromptI18NBackup','PromptI18NFailed','PromptIdDailyAvailable','PromptLeaderBoard','VerificationToken','_CollectionToPrompt','_CollectionToTag','_DatasetToPrompt','_DatasetToTag','_DocumentToDataset','_PinByUser','_PlaylistToPrompt','_PromptToTag','awsdms_apply_exceptions');`
 	pwq_tables := conn.Exec(ctx, query)
 	pwq_results, err := pwq_tables.ReadAll()
 	if err != nil {
