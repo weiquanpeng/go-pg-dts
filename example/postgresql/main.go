@@ -535,7 +535,7 @@ func handleFullSyncMode(ctx context.Context, cfg *config.Config) {
 		os.Exit(1)
 	}
 	defer conn.Close(ctx)
-	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name not in ('cdc_snapshot_job','cdc_snapshot_chunks','table_primary_keys','ConversationNew','ConversationSummary','JobEvent','PromptDisplayAssetVersionWorkflow','PromptI18NBackup','PromptI18NFailed','PromptIdDailyAvailable','PromptLeaderBoard','VerificationToken','_CollectionToPrompt','_CollectionToTag','_DatasetToPrompt','_DatasetToTag','_DocumentToDataset','_PinByUser','_PlaylistToPrompt','_PromptToTag','awsdms_apply_exceptions');`
+	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name not in ('cdc_snapshot_job','cdc_snapshot_chunks','table_primary_keys','Conversation','ConversationSummary','JobEvent','PromptDisplayAssetVersionWorkflow','PromptI18NBackup','PromptI18NFailed','PromptIdDailyAvailable','PromptLeaderBoard','VerificationToken','_CollectionToPrompt','_CollectionToTag','_DatasetToPrompt','_DatasetToTag','_DocumentToDataset','_PinByUser','_PlaylistToPrompt','_PromptToTag','awsdms_apply_exceptions');`
 	pwq_tables := conn.Exec(ctx, query)
 	pwq_results, err := pwq_tables.ReadAll()
 	if err != nil {
