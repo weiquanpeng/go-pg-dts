@@ -488,7 +488,7 @@ func (s *Snapshotter) buildIntegerRangeQuery(chunk *Chunk, orderByClause string,
 	if chunk.hasRangeBounds() && len(pkColumns) == 1 {
 		pkColumn := pkColumns[0]
 		return fmt.Sprintf(
-			`SELECT * FROM %s."%s" WHERE "%s" >= %d AND "%s" <= %d ORDER BY %s LIMIT %d`,
+			`SELECT * FROM %s."%s" WHERE "%s" >= %d AND "%s" <= %d ORDER BY "%s" LIMIT %d`,
 			chunk.TableSchema,
 			chunk.TableName,
 			pkColumn,
