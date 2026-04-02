@@ -103,7 +103,7 @@ func main() {
 		Snapshot: config.SnapshotConfig{
 			Enabled:           enableSnapshot,
 			Mode:              config.SnapshotModeInitial,
-			ChunkSize:         50000,
+			ChunkSize:         20000,
 			ClaimTimeout:      30 * time.Second,
 			HeartbeatInterval: 5 * time.Second,
 		},
@@ -127,7 +127,7 @@ func main() {
 		handleFullSyncMode(ctx, &cfg)
 	}
 
-	messages := make(chan Message, 50000)
+	messages := make(chan Message, 20000)
 	go Produce(ctx, targetPool, messages)
 
 	connector, err := cdc.NewConnector(ctx, cfg, FilteredMapper(messages))
@@ -205,7 +205,7 @@ func handleSnapshot(ctx *replication.ListenerContext, messages chan<- Message) {
 
 // Produce 从 messages 通道读取事件，批量写入目标库
 func Produce(ctx context.Context, w *pgxpool.Pool, messages <-chan Message) {
-	const bulkSize = 50000
+	const bulkSize = 20000
 	queue := make([]pendingItem, 0, bulkSize)
 
 	ticker := time.NewTicker(100 * time.Millisecond)

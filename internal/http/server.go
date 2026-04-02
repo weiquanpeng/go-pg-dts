@@ -63,6 +63,11 @@ func NewServer(cfg config.Config, registry metric.Registry, slotInfoProvider Slo
 }
 
 func (s *server) Listen() {
+	if s.cdcConfig.Metric.Port <= 0 {
+		logger.Info("metrics server disabled")
+		return
+	}
+
 	logger.Info(fmt.Sprintf("server starting on port :%d", s.cdcConfig.Metric.Port))
 
 	err := s.server.ListenAndServe()
