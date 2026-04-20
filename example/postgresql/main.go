@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -36,11 +35,11 @@ type Message struct {
 	Source  string
 }
 
-// pendingItem 用于批量处理时保存 SQL 和对应的 ack 函数
 type pendingItem struct {
 	query  *pgx.QueuedQuery
 	ack    func() error
 	source string
+	msg    *Message // 新增：保存原始消息，用于快照批量优化
 }
 
 // 主键缓存：表名 -> 主键列名切片
@@ -225,12 +224,14 @@ func Produce(ctx context.Context, w *pgxpool.Pool, messages <-chan Message) {
 				query:  &pgx.QueuedQuery{SQL: sql, Arguments: args},
 				ack:    event.Ack,
 				source: event.Source,
+				msg:    &event, // 新增
 			})
 
 			if len(queue) >= bulkSize {
 				startTarget := time.Now()
 				if err := flushBatch(ctx, w, queue); err != nil {
 					slog.Error("批量写入失败", "error", err)
+					os.Exit(1)
 				}
 				slog.Info("目标端写入耗时", "duration_ms", time.Since(startTarget).Milliseconds(), "batch_size", len(queue))
 				queue = queue[:0]
@@ -240,6 +241,7 @@ func Produce(ctx context.Context, w *pgxpool.Pool, messages <-chan Message) {
 			if len(queue) > 0 {
 				if err := flushBatch(ctx, w, queue); err != nil {
 					slog.Error("超时批量写入失败", "error", err)
+					os.Exit(1)
 				}
 				queue = queue[:0]
 			}
@@ -247,59 +249,166 @@ func Produce(ctx context.Context, w *pgxpool.Pool, messages <-chan Message) {
 	}
 }
 
-// flushBatch 执行批量 SQL，并逐一确认所有消息
 func flushBatch(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) error {
 	if len(items) == 0 {
 		return nil
 	}
 
-	// 统计来源
-	snapshotCount := 0
-	cdcCount := 0
+	// 检查是否全是快照消息
+	allSnapshot := true
 	for _, it := range items {
-		if it.source == "snapshot" {
-			snapshotCount++
-		} else {
-			cdcCount++
+		if it.source != "snapshot" {
+			allSnapshot = false
+			break
 		}
 	}
 
-	// 执行批量操作（代码不变）
+	if allSnapshot {
+		return flushBatchSnapshotMultiRow(ctx, conn, items)
+	}
+	return flushBatchGeneric(ctx, conn, items)
+}
+
+// 通用事务模式（单条 SQL 批量）
+func flushBatchGeneric(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
 	batch := &pgx.Batch{}
 	for _, it := range items {
 		batch.QueuedQueries = append(batch.QueuedQueries, it.query)
 	}
-	br := conn.SendBatch(ctx, batch)
+	br := tx.SendBatch(ctx, batch)
 	defer br.Close()
 
-	var batchErr error
 	for i := 0; i < len(items); i++ {
 		if _, err := br.Exec(); err != nil {
-			batchErr = errors.Join(batchErr, fmt.Errorf("第 %d 条 SQL 执行失败: %w", i, err))
+			return fmt.Errorf("第 %d 条 SQL 失败: %w", i, err)
 		}
 	}
-	if batchErr != nil {
-		return batchErr
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
 	}
 
-	// 确认消息
 	for _, it := range items {
-		if err := it.ack(); err != nil {
-			slog.Error("确认消息失败", "error", err)
-		}
+		it.ack()
 	}
 
-	// 分别打印日志
-	if snapshotCount > 0 {
-		slog.Info("snapshot write", "count", snapshotCount)
+	cdcCount := 0
+	for _, it := range items {
+		if it.source == "cdc" {
+			cdcCount++
+		}
 	}
 	if cdcCount > 0 {
 		slog.Info("cdc write", "count", cdcCount)
 	}
-	// 也可以合并打印
-	// slog.Info("batch write", "snapshot", snapshotCount, "cdc", cdcCount)
-
 	return nil
+}
+
+// 快照专用 COPY + 事务（比多行 INSERT 更快）
+func flushBatchSnapshotMultiRow(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) error {
+	// 按表分组
+	groups := make(map[string][]*Message)
+	for _, it := range items {
+		if it.msg == nil {
+			return flushBatchGeneric(ctx, conn, items) // fallback
+		}
+		groups[it.msg.Table] = append(groups[it.msg.Table], it.msg)
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	const maxRowsPerCopy = 5000 // COPY 批次大小（可调，不受参数限制）
+
+	for table, msgs := range groups {
+		// 检查主键是否存在（只校验，不用于 SQL）
+		if _, err := getPrimaryKeys(ctx, conn, table); err != nil {
+			return err
+		}
+		colTypes, err := getColumnTypes(ctx, conn, table)
+		if err != nil {
+			return err
+		}
+
+		// 获取列名列表（以第一条消息为准，排序保证顺序稳定）
+		columns := getSortedColumns(msgs[0].Data) // 辅助函数见下方
+
+		// 将 msgs 拆分成多个子批次进行 COPY
+		for i := 0; i < len(msgs); i += maxRowsPerCopy {
+			end := i + maxRowsPerCopy
+			if end > len(msgs) {
+				end = len(msgs)
+			}
+			sub := msgs[i:end]
+
+			// 准备 COPY 数据
+			copyData := make([][]interface{}, len(sub))
+			for idx, msg := range sub {
+				row := make([]interface{}, len(columns))
+				for j, col := range columns {
+					val := msg.Data[col]
+					typ := colTypes[col]
+					if typ == "json" || typ == "jsonb" {
+						if val == nil {
+							row[j] = nil
+						} else {
+							jsonBytes, err := json.Marshal(val)
+							if err != nil {
+								return fmt.Errorf("序列化 JSON 列 %s 失败: %w", col, err)
+							}
+							row[j] = string(jsonBytes)
+						}
+					} else {
+						row[j] = val
+					}
+				}
+				copyData[idx] = row
+			}
+
+			// 执行 COPY
+			schema, tableName := parseSchemaTable(table)
+			_, err = tx.CopyFrom(
+				ctx,
+				pgx.Identifier{schema, tableName},
+				columns,
+				pgx.CopyFromSlice(len(copyData), func(i int) ([]interface{}, error) {
+					return copyData[i], nil
+				}),
+			)
+			if err != nil {
+				return fmt.Errorf("COPY 到表 %s 失败: %w", table, err)
+			}
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+
+	for _, it := range items {
+		it.ack()
+	}
+	slog.Info("snapshot (COPY)", "rows", len(items))
+	return nil
+}
+
+// 辅助函数：获取排序后的列名切片
+func getSortedColumns(data map[string]interface{}) []string {
+	cols := make([]string, 0, len(data))
+	for col := range data {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	return cols
 }
 
 // buildSQL 根据事件类型动态生成 SQL 和参数
@@ -535,7 +644,7 @@ func handleFullSyncMode(ctx context.Context, cfg *config.Config) {
 		os.Exit(1)
 	}
 	defer conn.Close(ctx)
-	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name not in ('cdc_snapshot_job','cdc_snapshot_chunks','table_primary_keys','Conversation','ConversationSummary','JobEvent','PromptDisplayAssetVersionWorkflow','PromptI18NBackup','PromptI18NFailed','PromptIdDailyAvailable','PromptLeaderBoard','VerificationToken','_CollectionToPrompt','_CollectionToTag','_DatasetToPrompt','_DatasetToTag','_DocumentToDataset','_PinByUser','_PlaylistToPrompt','_PromptToTag','awsdms_apply_exceptions');`
+	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('ConversationNew');`
 	pwq_tables := conn.Exec(ctx, query)
 	pwq_results, err := pwq_tables.ReadAll()
 	if err != nil {
