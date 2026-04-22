@@ -230,7 +230,7 @@ func Produce(ctx context.Context, w *pgxpool.Pool, messages <-chan Message) {
 			if len(queue) >= bulkSize {
 				startTarget := time.Now()
 				if err := flushBatch(ctx, w, queue); err != nil {
-					slog.Error("批量写入失败", "error", err)
+					slog.Error("snapshot 批量写入失败", "error", err)
 					os.Exit(1)
 				}
 				slog.Info("目标端写入耗时", "duration_ms", time.Since(startTarget).Milliseconds(), "batch_size", len(queue))
@@ -240,7 +240,7 @@ func Produce(ctx context.Context, w *pgxpool.Pool, messages <-chan Message) {
 		case <-ticker.C:
 			if len(queue) > 0 {
 				if err := flushBatch(ctx, w, queue); err != nil {
-					slog.Error("超时批量写入失败", "error", err)
+					slog.Error("cdc批量写入失败", "error", err)
 					os.Exit(1)
 				}
 				queue = queue[:0]
@@ -269,29 +269,18 @@ func flushBatch(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) er
 	return flushBatchGeneric(ctx, conn, items)
 }
 
-// 通用事务模式（单条 SQL 批量）
 func flushBatchGeneric(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) error {
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
 	batch := &pgx.Batch{}
 	for _, it := range items {
 		batch.QueuedQueries = append(batch.QueuedQueries, it.query)
 	}
-	br := tx.SendBatch(ctx, batch)
+	br := conn.SendBatch(ctx, batch)
 	defer br.Close()
 
 	for i := 0; i < len(items); i++ {
 		if _, err := br.Exec(); err != nil {
 			return fmt.Errorf("第 %d 条 SQL 失败: %w", i, err)
 		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return err
 	}
 
 	for _, it := range items {
