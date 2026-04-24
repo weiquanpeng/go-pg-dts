@@ -50,12 +50,14 @@ func main() {
 	var metricPort int
 	var syncMode string
 	var enableSnapshot bool
+	var chunkSize int
 
 	flag.StringVar(&sourceDSN, "source", "", "源 PostgreSQL 连接 URL")
 	flag.StringVar(&targetDSN, "target", "", "目标 PostgreSQL 连接 URL")
 	flag.IntVar(&metricPort, "port", 8081, "metric server port")
 	flag.StringVar(&syncMode, "mode", "all", "sync mode: full for all tables, empty for preset tables")
 	flag.BoolVar(&enableSnapshot, "snapshot", true, "enable snapshot: true/false")
+	flag.IntVar(&chunkSize, "chunksize", 5000, "快照分块大小、通道缓冲区大小、批量写入大小")
 	flag.Parse()
 
 	if sourceDSN == "" || targetDSN == "" {
@@ -102,7 +104,7 @@ func main() {
 		Snapshot: config.SnapshotConfig{
 			Enabled:           enableSnapshot,
 			Mode:              config.SnapshotModeInitial,
-			ChunkSize:         20000,
+			ChunkSize:         int64(chunkSize),
 			ClaimTimeout:      30 * time.Second,
 			HeartbeatInterval: 5 * time.Second,
 		},
@@ -126,8 +128,8 @@ func main() {
 		handleFullSyncMode(ctx, &cfg)
 	}
 
-	messages := make(chan Message, 20000)
-	go Produce(ctx, targetPool, messages)
+	messages := make(chan Message, chunkSize)
+	go Produce(ctx, targetPool, chunkSize, messages)
 
 	connector, err := cdc.NewConnector(ctx, cfg, FilteredMapper(messages))
 	if err != nil {
@@ -203,10 +205,8 @@ func handleSnapshot(ctx *replication.ListenerContext, messages chan<- Message) {
 }
 
 // Produce 从 messages 通道读取事件，批量写入目标库
-func Produce(ctx context.Context, w *pgxpool.Pool, messages <-chan Message) {
-	const bulkSize = 20000
+func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan Message) {
 	queue := make([]pendingItem, 0, bulkSize)
-
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
