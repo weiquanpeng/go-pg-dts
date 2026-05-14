@@ -514,8 +514,7 @@ func buildUpsertSQL(ctx context.Context, conn *pgxpool.Pool, table string, data 
 		typ := colTypes[col]
 		if typ == "json" || typ == "jsonb" {
 			if val == nil {
-				// 对于 NULL，传递 JSON 字符串 "null"
-				args[i] = "null"
+				args[i] = nil
 			} else {
 				// 使用 json.Marshal 将任意值（通常为字符串或 map）正确编码为 JSON 字符串
 				jsonBytes, err := json.Marshal(val)

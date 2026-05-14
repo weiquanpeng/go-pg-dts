@@ -78,7 +78,7 @@ func main() {
 	flag.IntVar(&batchSize, "batch", 1000, "每次抽样的主键数量")
 	flag.DurationVar(&interval, "interval", 30*time.Second, "统计报告输出间隔")
 	flag.IntVar(&workers, "workers", 4, "并发校验的协程数（控制同时校验几张表）")
-	flag.IntVar(&ratePerSec, "rate", 100, "每张表每秒最多校验的行数（限流）")
+	flag.IntVar(&ratePerSec, "rate", 1000, "每张表每秒最多校验的行数（限流）")
 	flag.Parse()
 
 	if sourceDSN == "" || targetDSN == "" {
