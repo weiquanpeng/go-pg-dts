@@ -238,6 +238,14 @@ func (c *connector) Start(ctx context.Context) {
 			logger.Error("snapshot preparation failed", "error", err)
 			return
 		}
+		logger.Info("[connector] snapshot phase finished")
+		if c.snapshotter != nil {
+			if err := c.snapshotter.CommitTransaction(ctx); err != nil {
+				logger.Error("failed to commit snapshot transaction", "error", err)
+			} else {
+				logger.Info("[connector] snapshot transaction committed, moving to CDC phase")
+			}
+		}
 	} else {
 		// No snapshot: Create slot normally before starting CDC
 		logger.Info("creating replication slot for CDC")

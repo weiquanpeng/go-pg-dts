@@ -41,6 +41,7 @@ type Snapshotter struct {
 	tables             publication.Tables
 	config             config.SnapshotConfig
 	orderByMu          sync.RWMutex
+	isCoordinator      bool
 }
 
 type orderByCacheEntry struct {
@@ -104,9 +105,31 @@ func (s *Snapshotter) Prepare(ctx context.Context, slotName string) error {
 		return errors.Wrap(err, "setup job")
 	}
 
+	s.isCoordinator = isCoordinator
+
 	if isCoordinator {
 		logger.Debug("[coordinator] snapshot transaction kept OPEN - replication slot must be created NOW")
 	}
+	return nil
+}
+
+func (s *Snapshotter) CommitTransaction(ctx context.Context) error {
+	if !s.isCoordinator {
+		return nil // 不是协调者，无事可做
+	}
+	if s.exportSnapshotConn == nil {
+		return nil // 连接已经不存在了
+	}
+	logger.Info("[snapshotter] committing snapshot transaction to release VACUUM lock")
+
+	if err := s.execSQL(ctx, s.exportSnapshotConn, "COMMIT"); err != nil {
+		return errors.Wrap(err, "commit snapshot transaction failed")
+	}
+
+	if err := s.exportSnapshotConn.Close(ctx); err != nil {
+		return errors.Wrap(err, "close snapshot connection failed")
+	}
+	s.exportSnapshotConn = nil
 	return nil
 }
 

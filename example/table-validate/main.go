@@ -12,16 +12,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type TableInfo struct {
-	Name        string
-	PrimaryKeys []string
+	Name          string
+	PrimaryKeys   []string
+	EstimatedRows int64
 }
 
 type pkTuple struct {
-	Values map[string]interface{}
+	Value  interface{}
 	String string
 }
 
@@ -50,14 +52,24 @@ func (sc *StatsCollector) AddMismatch(table string, pk string) {
 	sc.mismatches[table] = append(sc.mismatches[table], pk)
 }
 
-func (sc *StatsCollector) GetAndReset() (checked map[string]int64, mismatches map[string][]string) {
+func (sc *StatsCollector) GetChecked() map[string]int64 {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	checked = sc.checked
-	mismatches = sc.mismatches
-	sc.checked = make(map[string]int64)
-	sc.mismatches = make(map[string][]string)
-	return
+	copied := make(map[string]int64, len(sc.checked))
+	for k, v := range sc.checked {
+		copied[k] = v
+	}
+	return copied
+}
+
+func (sc *StatsCollector) GetMismatchesCopy() map[string][]string {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	copied := make(map[string][]string, len(sc.mismatches))
+	for k, v := range sc.mismatches {
+		copied[k] = append([]string(nil), v...)
+	}
+	return copied
 }
 
 var wg sync.WaitGroup
@@ -73,12 +85,12 @@ func main() {
 
 	flag.StringVar(&sourceDSN, "source", "", "源数据库 DSN")
 	flag.StringVar(&targetDSN, "target", "", "目标数据库 DSN")
-	flag.Var(&tables, "tables", "要校验的表名（可多次指定），如 --tables=table1 --tables=table2")
+	flag.Var(&tables, "tables", "要校验的表名（可多次指定）")
 	flag.StringVar(&tablesSQL, "tables-sql", "", "执行自定义 SQL 获取表名列表")
-	flag.IntVar(&batchSize, "batch", 1000, "每次抽样的主键数量")
+	flag.IntVar(&batchSize, "batch", 1000, "每批校验的主键数量")
 	flag.DurationVar(&interval, "interval", 30*time.Second, "统计报告输出间隔")
-	flag.IntVar(&workers, "workers", 4, "并发校验的协程数（控制同时校验几张表）")
-	flag.IntVar(&ratePerSec, "rate", 1000, "每张表每秒最多校验的行数（限流）")
+	flag.IntVar(&workers, "workers", 4, "并发校验的协程数")
+	flag.IntVar(&ratePerSec, "rate", 1000, "每张表每秒最多校验的行数")
 	flag.Parse()
 
 	if sourceDSN == "" || targetDSN == "" {
@@ -155,11 +167,20 @@ func main() {
 		if err != nil {
 			log.Fatalf("获取表 %s 主键失败: %v", tbl, err)
 		}
+		if len(pks) != 1 {
+			log.Fatalf("表 %s 主键列数不为1（当前为 %d），本工具仅支持单列主键", tbl, len(pks))
+		}
+		estRows, err := getEstimatedRowCount(ctx, srcPool, tbl)
+		if err != nil {
+			log.Printf("表 %s 获取预估行数失败: %v (将不显示进度百分比)", tbl, err)
+			estRows = 0
+		}
 		tableInfos = append(tableInfos, TableInfo{
-			Name:        tbl,
-			PrimaryKeys: pks,
+			Name:          tbl,
+			PrimaryKeys:   pks,
+			EstimatedRows: estRows,
 		})
-		log.Printf("表 %s 主键: %v", tbl, pks)
+		log.Printf("表 %s 主键: %v, 预估行数: %d", tbl, pks, estRows)
 	}
 
 	stats := NewStatsCollector()
@@ -176,9 +197,9 @@ func main() {
 				return
 			}
 
-			log.Printf("开始持续校验表 %s（目标速率 %d 行/秒）", ti.Name, ratePerSec)
+			log.Printf("开始校验表 %s（每批 %d 行，目标速率 %d 行/秒）", ti.Name, batchSize, ratePerSec)
 
-			innerSem := make(chan struct{}, 20)
+			var lastPK interface{} = nil
 			throttle := time.NewTicker(time.Second / time.Duration(ratePerSec))
 			defer throttle.Stop()
 
@@ -190,51 +211,60 @@ func main() {
 				default:
 				}
 
-				pkTuples, err := samplePrimaryKeys(ctx, srcPool, ti, batchSize)
+				pkTuples, nextPK, err := fetchPrimaryKeysBatch(ctx, srcPool, ti, lastPK, batchSize)
 				if err != nil {
-					log.Printf("表 %s 抽样主键失败: %v", ti.Name, err)
+					log.Printf("表 %s 获取主键批次失败: %v", ti.Name, err)
 					time.Sleep(5 * time.Second)
 					continue
 				}
+
 				if len(pkTuples) == 0 {
+					log.Printf("表 %s 全表扫描完成（无更多数据），校验结束", ti.Name)
+					break
+				}
+
+				consistent, err := batchCheck(ctx, srcPool, tgtPool, ti, pkTuples)
+				if err != nil {
+					log.Printf("表 %s 批量比对失败: %v", ti.Name, err)
 					time.Sleep(5 * time.Second)
 					continue
 				}
 
-				var wgInner sync.WaitGroup
-				for _, pk := range pkTuples {
-					wgInner.Add(1)
-					go func(pk pkTuple) {
-						defer wgInner.Done()
-						innerSem <- struct{}{}
-						defer func() { <-innerSem }()
-
-						select {
-						case <-throttle.C:
-						case <-ctx.Done():
-							return
-						}
-
-						srcHash, err := getRowHash(ctx, srcPool, ti, pk.Values)
-						if err != nil {
-							log.Printf("获取源哈希失败 pk=%v: %v", pk.Values, err)
-							return
-						}
-						tgtHash, err := getRowHash(ctx, tgtPool, ti, pk.Values)
-						if err != nil {
-							log.Printf("获取目标哈希失败 pk=%v: %v", pk.Values, err)
-							return
-						}
-						if srcHash != tgtHash {
+				if consistent {
+					stats.AddChecked(ti.Name, int64(len(pkTuples)))
+				} else {
+					diffPKs, err := findDiffPKs(ctx, srcPool, tgtPool, ti, pkTuples)
+					if err != nil {
+						log.Printf("表 %s 查找差异行失败: %v", ti.Name, err)
+					} else {
+						stats.AddChecked(ti.Name, int64(len(pkTuples)))
+						for _, pk := range diffPKs {
 							stats.AddMismatch(ti.Name, pk.String)
 						}
-						stats.AddChecked(ti.Name, 1)
-					}(pk)
+					}
 				}
-				wgInner.Wait()
+
+				lastPK = nextPK
+
+				select {
+				case <-throttle.C:
+				case <-ctx.Done():
+					return
+				}
+
+				if len(pkTuples) < batchSize {
+					log.Printf("表 %s 全表扫描完成（最后一批不足 %d 行），校验结束", ti.Name, batchSize)
+					break
+				}
 			}
 		}(ti)
 	}
+
+	go func() {
+		wg.Wait()
+		log.Println("所有表校验完成，程序即将退出...")
+		cancel()
+	}()
 
 	reportTicker := time.NewTicker(interval)
 	defer reportTicker.Stop()
@@ -245,102 +275,138 @@ func main() {
 			log.Println("程序退出")
 			return
 		case <-reportTicker.C:
-			checked, mismatches := stats.GetAndReset()
-			printReport(checked, mismatches)
+			checked := stats.GetChecked()
+			mismatches := stats.GetMismatchesCopy()
+			printProgressReport(checked, mismatches, tableInfos)
 		}
 	}
 }
 
-func printReport(checked map[string]int64, mismatches map[string][]string) {
-	log.Println("========== 校验统计报告 ==========")
+// 增强版进度报告：包含不一致率和主键列表（即使无不一致也显示）
+func printProgressReport(checked map[string]int64, mismatches map[string][]string, tableInfos []TableInfo) {
+	log.Println("========== 校验进度报告 ==========")
+	estMap := make(map[string]int64)
+	for _, ti := range tableInfos {
+		estMap[ti.Name] = ti.EstimatedRows
+	}
+
 	for table, cnt := range checked {
-		mismatchList := mismatches[table]
-		if len(mismatchList) == 0 {
-			log.Printf("表 %s: 校验 %d 行，全部一致", table, cnt)
+		est := estMap[table]
+		if est > 0 {
+			percent := float64(cnt) / float64(est) * 100
+			log.Printf("表 %s: 已校验 %d / %d 行 (%.2f%%)", table, cnt, est, percent)
 		} else {
-			log.Printf("表 %s: 校验 %d 行，不一致行数 %d，主键列表：", table, cnt, len(mismatchList))
+			log.Printf("表 %s: 已校验 %d 行 (无预估行数)", table, cnt)
+		}
+
+		// 不一致信息
+		mismatchList := mismatches[table]
+		mismatchCount := len(mismatchList)
+		if mismatchCount == 0 {
+			log.Printf("  无不一致行")
+		} else {
+			rate := float64(mismatchCount) / float64(cnt) * 100
+			log.Printf("  累计发现 %d 行不一致，不一致率: %.4f%%", mismatchCount, rate)
+			log.Printf("  不一致主键列表：")
 			for _, pk := range mismatchList {
-				log.Printf("  - %s", pk)
+				log.Printf("    - %s", pk)
 			}
 		}
 	}
 	log.Println("===================================")
 }
 
-func samplePrimaryKeys(ctx context.Context, pool *pgxpool.Pool, ti TableInfo, limit int) ([]pkTuple, error) {
-	if limit <= 0 {
-		return nil, nil
-	}
-	pkCols := quoteIdentifiers(ti.PrimaryKeys)
+func fetchPrimaryKeysBatch(ctx context.Context, pool *pgxpool.Pool, ti TableInfo, lastPK interface{}, limit int) ([]pkTuple, interface{}, error) {
+	pkColumn := ti.PrimaryKeys[0]
+	quotedPK := quoteIdentifier(pkColumn)
 	quotedTable := quoteIdentifier(ti.Name)
 
-	sql := fmt.Sprintf(`
-		SELECT %s FROM %s TABLESAMPLE SYSTEM(1)
-		LIMIT $1
-	`, pkCols, quotedTable)
+	var sql string
+	var args []interface{}
 
-	rows, err := pool.Query(ctx, sql, limit)
+	if lastPK == nil {
+		sql = fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT $1", quotedPK, quotedTable, quotedPK)
+		args = []interface{}{limit}
+	} else {
+		sql = fmt.Sprintf("SELECT %s FROM %s WHERE %s > $1 ORDER BY %s LIMIT $2", quotedPK, quotedTable, quotedPK, quotedPK)
+		args = []interface{}{lastPK, limit}
+	}
+
+	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, fmt.Errorf("抽样查询失败: %w", err)
+		return nil, nil, err
 	}
 	defer rows.Close()
 
 	var tuples []pkTuple
+	var lastValue interface{}
 	for rows.Next() {
-		values := make([]interface{}, len(ti.PrimaryKeys))
-		valuePtrs := make([]interface{}, len(ti.PrimaryKeys))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, err
-		}
-		pkMap := make(map[string]interface{})
-		pkStrs := make([]string, len(ti.PrimaryKeys))
-		for i, col := range ti.PrimaryKeys {
-			pkMap[col] = values[i]
-			pkStrs[i] = fmt.Sprintf("%v", values[i])
+		var val interface{}
+		if err := rows.Scan(&val); err != nil {
+			return nil, nil, err
 		}
 		tuples = append(tuples, pkTuple{
-			Values: pkMap,
-			String: strings.Join(pkStrs, ","),
+			Value:  val,
+			String: fmt.Sprintf("%v", val),
 		})
+		lastValue = val
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	return tuples, lastValue, nil
+}
+
+func batchCheck(ctx context.Context, srcPool, tgtPool *pgxpool.Pool, ti TableInfo, pks []pkTuple) (bool, error) {
+	if len(pks) == 0 {
+		return true, nil
+	}
+	pkColumn := ti.PrimaryKeys[0]
+	quotedPK := quoteIdentifier(pkColumn)
+	quotedTable := quoteIdentifier(ti.Name)
+
+	values := make([]interface{}, len(pks))
+	for i, pk := range pks {
+		values[i] = pk.Value
 	}
 
-	if len(tuples) == 0 && limit > 0 {
-		sqlRand := fmt.Sprintf(`
-			SELECT %s FROM %s ORDER BY random() LIMIT $1
-		`, pkCols, quotedTable)
-		rows2, err := pool.Query(ctx, sqlRand, limit)
-		if err != nil {
-			return nil, err
+	sql := fmt.Sprintf(`
+		SELECT md5(string_agg(row_to_json(t)::text, '' ORDER BY %s))
+		FROM %s t
+		WHERE %s = ANY($1)
+	`, quotedPK, quotedTable, quotedPK)
+
+	var srcHash, tgtHash string
+	err := srcPool.QueryRow(ctx, sql, values).Scan(&srcHash)
+	if err != nil && err != pgx.ErrNoRows {
+		return false, err
+	}
+	err = tgtPool.QueryRow(ctx, sql, values).Scan(&tgtHash)
+	if err != nil && err != pgx.ErrNoRows {
+		return false, err
+	}
+	return srcHash == tgtHash, nil
+}
+
+func findDiffPKs(ctx context.Context, srcPool, tgtPool *pgxpool.Pool, ti TableInfo, pks []pkTuple) ([]pkTuple, error) {
+	var diff []pkTuple
+	for _, pk := range pks {
+		pkMap := map[string]interface{}{
+			ti.PrimaryKeys[0]: pk.Value,
 		}
-		defer rows2.Close()
-		for rows2.Next() {
-			values := make([]interface{}, len(ti.PrimaryKeys))
-			valuePtrs := make([]interface{}, len(ti.PrimaryKeys))
-			for i := range values {
-				valuePtrs[i] = &values[i]
-			}
-			if err := rows2.Scan(valuePtrs...); err != nil {
-				return nil, err
-			}
-			pkMap := make(map[string]interface{})
-			pkStrs := make([]string, len(ti.PrimaryKeys))
-			for i, col := range ti.PrimaryKeys {
-				pkMap[col] = values[i]
-				pkStrs[i] = fmt.Sprintf("%v", values[i])
-			}
-			tuples = append(tuples, pkTuple{
-				Values: pkMap,
-				String: strings.Join(pkStrs, ","),
-			})
+		srcHash, err := getRowHash(ctx, srcPool, ti, pkMap)
+		if err != nil {
+			return nil, fmt.Errorf("源端哈希失败 pk=%v: %w", pk.Value, err)
+		}
+		tgtHash, err := getRowHash(ctx, tgtPool, ti, pkMap)
+		if err != nil {
+			return nil, fmt.Errorf("目标端哈希失败 pk=%v: %w", pk.Value, err)
+		}
+		if srcHash != tgtHash {
+			diff = append(diff, pk)
 		}
 	}
-	return tuples, nil
+	return diff, nil
 }
 
 func getRowHash(ctx context.Context, pool *pgxpool.Pool, ti TableInfo, pkValues map[string]interface{}) (string, error) {
@@ -370,6 +436,21 @@ func getRowHash(ctx context.Context, pool *pgxpool.Pool, ti TableInfo, pkValues 
 		return "", fmt.Errorf("查询行哈希失败: %w", err)
 	}
 	return hash, nil
+}
+
+func getEstimatedRowCount(ctx context.Context, pool *pgxpool.Pool, tableName string) (int64, error) {
+	schema, table := parseSchemaTable(tableName)
+	var reltuples float32
+	err := pool.QueryRow(ctx, `
+		SELECT c.reltuples
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2
+	`, schema, table).Scan(&reltuples)
+	if err != nil {
+		return 0, fmt.Errorf("查询 reltuples 失败: %w", err)
+	}
+	return int64(reltuples), nil
 }
 
 func getPrimaryKeys(ctx context.Context, pool *pgxpool.Pool, tableName string) ([]string, error) {
@@ -409,14 +490,6 @@ func getPrimaryKeys(ctx context.Context, pool *pgxpool.Pool, tableName string) (
 
 func quoteIdentifier(ident string) string {
 	return fmt.Sprintf(`"%s"`, ident)
-}
-
-func quoteIdentifiers(idents []string) string {
-	quoted := make([]string, len(idents))
-	for i, id := range idents {
-		quoted[i] = quoteIdentifier(id)
-	}
-	return strings.Join(quoted, ", ")
 }
 
 func parseSchemaTable(fullName string) (schema, table string) {
