@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/weiquanpeng/go-pg-dts/pq"
 )
 
 func TestNewPrimaryKeepaliveMessage(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Trendyol/go-pq-cdc/logger"
+	"github.com/weiquanpeng/go-pg-dts/logger"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgconn"
 )

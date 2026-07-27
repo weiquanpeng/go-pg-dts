@@ -3,7 +3,7 @@ package message
 import (
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
+	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
 	"github.com/go-playground/errors"
 )
 

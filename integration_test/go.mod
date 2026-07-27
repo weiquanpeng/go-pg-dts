@@ -1,16 +1,16 @@
-module github.com/Trendyol/go-pq-cdc/integration
+module github.com/weiquanpeng/go-pg-dts/integration
 
 go 1.23.0
 
-replace github.com/Trendyol/go-pq-cdc => ../
+replace github.com/weiquanpeng/go-pg-dts => ../
 
 require (
-	github.com/Trendyol/go-pq-cdc v0.0.0-00010101000000-000000000000
 	github.com/go-playground/errors v3.3.0+incompatible
 	github.com/golang-migrate/migrate/v4 v4.17.1
 	github.com/jackc/pgx/v5 v5.6.0
 	github.com/stretchr/testify v1.9.0
 	github.com/testcontainers/testcontainers-go v0.31.0
+	github.com/weiquanpeng/go-pg-dts v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -52,6 +52,7 @@ require (
 	github.com/moby/sys/user v0.1.0 // indirect
 	github.com/moby/term v0.5.0 // indirect
 	github.com/morikuni/aec v1.0.0 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect

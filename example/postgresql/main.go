@@ -13,14 +13,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/weiquanpeng/go-pg-dts/pq"
 
-	cdc "github.com/Trendyol/go-pq-cdc"
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
-	"github.com/Trendyol/go-pq-cdc/pq/replication"
-	"github.com/Trendyol/go-pq-cdc/pq/slot"
+	cdc "github.com/weiquanpeng/go-pg-dts"
+	"github.com/weiquanpeng/go-pg-dts/config"
+	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
+	"github.com/weiquanpeng/go-pg-dts/pq/publication"
+	"github.com/weiquanpeng/go-pg-dts/pq/replication"
+	"github.com/weiquanpeng/go-pg-dts/pq/slot"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -48,16 +48,18 @@ var primaryKeyCache = sync.Map{}
 func main() {
 	var sourceDSN, targetDSN string
 	var metricPort int
-	var syncMode string
-	var enableSnapshot bool
+	var snapshotFlag string
 	var chunkSize int
+	var publicationName, slotName string
 
 	flag.StringVar(&sourceDSN, "source", "", "源 PostgreSQL 连接 URL")
 	flag.StringVar(&targetDSN, "target", "", "目标 PostgreSQL 连接 URL")
 	flag.IntVar(&metricPort, "port", 8081, "metric server port")
-	flag.StringVar(&syncMode, "mode", "all", "sync mode: full for all tables, empty for preset tables")
-	flag.BoolVar(&enableSnapshot, "snapshot", true, "enable snapshot: true/false")
+	flag.StringVar(&snapshotFlag, "snapshot", "true", "true=全量+增量, false=仅增量, only=仅全量（不创建复制槽，跑完退出）")
 	flag.IntVar(&chunkSize, "chunksize", 5000, "快照分块大小、通道缓冲区大小、批量写入大小")
+	flag.StringVar(&publicationName, "publication", "cdc_publication", "源库 publication 名称")
+	// 该名字同时是快照任务的标识（cdc_snapshot_job.slot_name），换名会重新执行一次全量
+	flag.StringVar(&slotName, "slot", "cdc_slot", "源库复制槽名称，同时作为快照任务标识，同一实例内需唯一")
 	flag.Parse()
 
 	if sourceDSN == "" || targetDSN == "" {
@@ -65,6 +67,14 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+	snapshotEnabled, snapshotMode, err := parseSnapshotFlag(snapshotFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		flag.Usage()
+		os.Exit(1)
+	}
+	snapshotOnly := snapshotMode == config.SnapshotModeSnapshotOnly
 
 	ctx := context.Background()
 
@@ -84,26 +94,22 @@ func main() {
 		Database: srcConnConfig.Database,
 		Publication: publication.Config{
 			CreateIfNotExists: true,
-			Name:              "cdc_publication",
+			Name:              publicationName,
 			Operations: publication.Operations{
 				publication.OperationInsert,
 				publication.OperationDelete,
 				publication.OperationUpdate,
 			},
-			Tables: publication.Tables{publication.Table{
-				Name:            "Conversation",
-				ReplicaIdentity: publication.ReplicaIdentityDefault,
-				Schema:          "public",
-			}},
+			// Tables 留空，由 loadPublicationTables 从源库查询后填充
 		},
 		Slot: slot.Config{
 			CreateIfNotExists:           true,
-			Name:                        "cdc_slot",
+			Name:                        slotName,
 			SlotActivityCheckerInterval: 3000,
 		},
 		Snapshot: config.SnapshotConfig{
-			Enabled:           enableSnapshot,
-			Mode:              config.SnapshotModeInitial,
+			Enabled:           snapshotEnabled,
+			Mode:              snapshotMode,
 			ChunkSize:         int64(chunkSize),
 			ClaimTimeout:      30 * time.Second,
 			HeartbeatInterval: 5 * time.Second,
@@ -124,12 +130,20 @@ func main() {
 	}
 	defer targetPool.Close()
 
-	if syncMode == "all" {
-		handleFullSyncMode(ctx, &cfg)
+	loadPublicationTables(ctx, &cfg)
+
+	// snapshot_only 模式取表走 Snapshot.Tables 分支，与 publication 无关。
+	// initial 模式必须保持 Snapshot.Tables 为空，否则 GetSnapshotTables 会切到
+	// validateSnapshotSubset 分支，在 publication 已存在且表集合不一致时直接报错。
+	if snapshotOnly {
+		cfg.Snapshot.Tables = cfg.Publication.Tables
+		// 快照任务标识固定用 --slot，否则库会退化成 snapshot_only_<数据库名>
+		cfg.Snapshot.ID = slotName
 	}
 
 	messages := make(chan Message, chunkSize)
-	go Produce(ctx, targetPool, chunkSize, messages)
+	produceDone := make(chan struct{})
+	go Produce(ctx, targetPool, chunkSize, messages, produceDone)
 
 	connector, err := cdc.NewConnector(ctx, cfg, FilteredMapper(messages))
 	if err != nil {
@@ -137,6 +151,32 @@ func main() {
 		os.Exit(1)
 	}
 	connector.Start(ctx)
+
+	// snapshot_only 模式下 Start 在快照结束后返回，此时快照 worker 已停止写入，
+	// 关闭通道让 Produce 落盘残余数据，避免最后不满一批的行随进程退出而丢失。
+	// CDC 模式 Start 不会正常返回，且 stream 仍可能写入 messages，因此不能关闭。
+	if snapshotOnly {
+		close(messages)
+		<-produceDone
+		slog.Info("快照结束，残余数据已落盘")
+	}
+}
+
+// parseSnapshotFlag 解析 --snapshot 取值：
+//   - true：全量 + 增量，创建复制槽后常驻
+//   - false：跳过全量，仅增量
+//   - only：仅全量，不创建复制槽，跑完即退出
+func parseSnapshotFlag(v string) (enabled bool, mode config.SnapshotMode, err error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true":
+		return true, config.SnapshotModeInitial, nil
+	case "false":
+		return false, config.SnapshotModeInitial, nil
+	case "only":
+		return true, config.SnapshotModeSnapshotOnly, nil
+	default:
+		return false, "", fmt.Errorf("--snapshot 取值无效: %q，可选 true / false / only", v)
+	}
 }
 
 // FilteredMapper 将 CDC 事件转换为通用 Message
@@ -204,15 +244,30 @@ func handleSnapshot(ctx *replication.ListenerContext, messages chan<- Message) {
 	}
 }
 
-// Produce 从 messages 通道读取事件，批量写入目标库
-func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan Message) {
+// Produce 从 messages 通道读取事件，批量写入目标库。
+// messages 被关闭后会先落盘残余数据，再关闭 done 通知调用方收尾完成。
+func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan Message, done chan<- struct{}) {
+	defer close(done)
+
 	queue := make([]pendingItem, 0, bulkSize)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case event := <-messages:
+		case event, ok := <-messages:
+			if !ok {
+				// 通道关闭且已取空，落盘最后不满一批的数据后退出
+				if len(queue) > 0 {
+					if err := flushBatch(ctx, w, queue); err != nil {
+						slog.Error("收尾批量写入失败", "error", err)
+						os.Exit(1)
+					}
+					slog.Info("收尾写入完成", "batch_size", len(queue))
+				}
+				return
+			}
+
 			// 根据事件类型构建 SQL
 			sql, args, err := buildSQL(ctx, w, event)
 			if err != nil {
@@ -625,14 +680,16 @@ func parseSchemaTable(fullName string) (schema, table string) {
 	return "public", parts[0]
 }
 
-func handleFullSyncMode(ctx context.Context, cfg *config.Config) {
+// loadPublicationTables 从源库查询待迁移的表，是表清单的唯一来源。
+// 调整迁移范围请修改下方 query 的 WHERE 条件。
+func loadPublicationTables(ctx context.Context, cfg *config.Config) {
 	conn, err := pq.NewConnection(ctx, cfg.DSN())
 	if err != nil {
 		slog.Error("create pq connection failed", "error", err)
 		os.Exit(1)
 	}
 	defer conn.Close(ctx)
-	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('ConversationNew');`
+	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('UserReport');`
 	pwq_tables := conn.Exec(ctx, query)
 	pwq_results, err := pwq_tables.ReadAll()
 	if err != nil {
@@ -650,5 +707,11 @@ func handleFullSyncMode(ctx context.Context, cfg *config.Config) {
 			pubTables = append(pubTables, pubTable)
 		}
 	}
+	// 表清单为空会在 NewConnector 的配置校验里报错，这里提前拦下给出可定位的提示
+	if len(pubTables) == 0 {
+		slog.Error("未查询到任何待迁移的表，请检查 loadPublicationTables 中的查询条件")
+		os.Exit(1)
+	}
+	slog.Info("待迁移表清单已加载", "count", len(pubTables))
 	cfg.Publication.Tables = pubTables
 }

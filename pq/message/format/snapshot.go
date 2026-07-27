@@ -3,7 +3,7 @@ package format
 import (
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/weiquanpeng/go-pg-dts/pq"
 )
 
 // SnapshotEventType represents the type of snapshot event

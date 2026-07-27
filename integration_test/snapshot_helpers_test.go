@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/weiquanpeng/go-pg-dts/pq"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 

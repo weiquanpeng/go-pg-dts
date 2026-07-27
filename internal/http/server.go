@@ -9,10 +9,10 @@ import (
 	"net/http/pprof"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/internal/metric"
-	"github.com/Trendyol/go-pq-cdc/logger"
-	"github.com/Trendyol/go-pq-cdc/pq/slot"
+	"github.com/weiquanpeng/go-pg-dts/config"
+	"github.com/weiquanpeng/go-pg-dts/internal/metric"
+	"github.com/weiquanpeng/go-pg-dts/logger"
+	"github.com/weiquanpeng/go-pg-dts/pq/slot"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 

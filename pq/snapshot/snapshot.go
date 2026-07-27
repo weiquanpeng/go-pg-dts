@@ -8,12 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/internal/metric"
-	"github.com/Trendyol/go-pq-cdc/logger"
-	"github.com/Trendyol/go-pq-cdc/pq"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
+	"github.com/weiquanpeng/go-pg-dts/config"
+	"github.com/weiquanpeng/go-pg-dts/internal/metric"
+	"github.com/weiquanpeng/go-pg-dts/logger"
+	"github.com/weiquanpeng/go-pg-dts/pq"
+	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
+	"github.com/weiquanpeng/go-pg-dts/pq/publication"
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgtype"
 )

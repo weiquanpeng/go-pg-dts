@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/logger"
-	"github.com/Trendyol/go-pq-cdc/pq"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
+	"github.com/weiquanpeng/go-pg-dts/logger"
+	"github.com/weiquanpeng/go-pg-dts/pq"
+	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
 	"github.com/go-playground/errors"
 )
 

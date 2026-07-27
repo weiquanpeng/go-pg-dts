@@ -6,7 +6,7 @@ import (
 
 	"github.com/go-playground/errors"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/weiquanpeng/go-pg-dts/pq"
 )
 
 // PrimaryKeepaliveMessage represents a 'k' keep-alive message sent by the primary server.

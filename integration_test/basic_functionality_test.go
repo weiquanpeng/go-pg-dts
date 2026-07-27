@@ -3,9 +3,9 @@ package integration
 import (
 	"context"
 	"fmt"
-	cdc "github.com/Trendyol/go-pq-cdc"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/replication"
+	cdc "github.com/weiquanpeng/go-pg-dts"
+	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
+	"github.com/weiquanpeng/go-pg-dts/pq/replication"
 	"github.com/stretchr/testify/assert"
 	"testing"
 	"time"

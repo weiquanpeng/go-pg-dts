@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/weiquanpeng/go-pg-dts/pq"
 	"github.com/go-playground/errors"
 )
 

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/pq"
+	"github.com/weiquanpeng/go-pg-dts/config"
+	"github.com/weiquanpeng/go-pg-dts/pq"
 	"github.com/go-playground/errors"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"

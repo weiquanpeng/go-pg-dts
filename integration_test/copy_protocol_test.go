@@ -2,10 +2,10 @@ package integration
 
 import (
 	"context"
-	cdc "github.com/Trendyol/go-pq-cdc"
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/replication"
+	cdc "github.com/weiquanpeng/go-pg-dts"
+	"github.com/weiquanpeng/go-pg-dts/config"
+	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
+	"github.com/weiquanpeng/go-pg-dts/pq/replication"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"

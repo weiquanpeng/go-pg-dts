@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Trendyol/go-pq-cdc/logger"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
-	"github.com/Trendyol/go-pq-cdc/pq/slot"
+	"github.com/weiquanpeng/go-pg-dts/logger"
+	"github.com/weiquanpeng/go-pg-dts/pq/publication"
+	"github.com/weiquanpeng/go-pg-dts/pq/slot"
 )
 
 type Config struct {

@@ -1,4 +1,4 @@
-# go-pq-cdc [![Go Reference](https://pkg.go.dev/badge/github.com/Trendyol/go-dcp.svg)](https://pkg.go.dev/github.com/Trendyol/go-pq-cdc) [![Go Report Card](https://goreportcard.com/badge/github.com/Trendyol/go-pq-cdc)](https://goreportcard.com/report/github.com/Trendyol/go-pq-cdc) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Trendyol/go-pq-cdc/badge)](https://scorecard.dev/viewer/?uri=github.com/Trendyol/go-pq-cdc)
+# go-pq-cdc [![Go Reference](https://pkg.go.dev/badge/github.com/Trendyol/go-dcp.svg)](https://pkg.go.dev/github.com/weiquanpeng/go-pg-dts) [![Go Report Card](https://goreportcard.com/badge/github.com/weiquanpeng/go-pg-dts)](https://goreportcard.com/report/github.com/weiquanpeng/go-pg-dts) [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/weiquanpeng/go-pg-dts/badge)](https://scorecard.dev/viewer/?uri=github.com/weiquanpeng/go-pg-dts)
 
 go-pq-cdc is designed to provide efficient and lightweight Change Data Capture (CDC) for PostgreSQL databases.
 The architecture leverages PostgreSQL's built-in logical replication capabilities to capture changes in the database and
@@ -46,13 +46,13 @@ ensuring low resource consumption and high performance.
 CDC systems are crucial for real-time data synchronization, analytics, and event-driven architectures.
 Our main goal is to build a cdc base library for faster and stateful systems.
 
-- [Postgresql to Elasticsearch Connector](https://github.com/Trendyol/go-pq-cdc-elasticsearch)
+- [Postgresql to Elasticsearch Connector](https://github.com/weiquanpeng/go-pg-dts-elasticsearch)
 - [Postgresql to Kafka Connector](https://github.com/Trendyol/go-pq-cdc-kafka)
 
 ### Usage
 
 ```sh
-go get github.com/Trendyol/go-pq-cdc
+go get github.com/weiquanpeng/go-pg-dts
 ```
 
 ```go
@@ -60,12 +60,12 @@ package main
 
 import (
 	"context"
-	cdc "github.com/Trendyol/go-pq-cdc"
-	"github.com/Trendyol/go-pq-cdc/config"
-	"github.com/Trendyol/go-pq-cdc/pq/message/format"
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
-	"github.com/Trendyol/go-pq-cdc/pq/replication"
-	"github.com/Trendyol/go-pq-cdc/pq/slot"
+	cdc "github.com/weiquanpeng/go-pg-dts"
+	"github.com/weiquanpeng/go-pg-dts/config"
+	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
+	"github.com/weiquanpeng/go-pg-dts/pq/publication"
+	"github.com/weiquanpeng/go-pg-dts/pq/replication"
+	"github.com/weiquanpeng/go-pg-dts/pq/slot"
 	"log/slog"
 	"os"
 )
@@ -139,7 +139,7 @@ func Handler(ctx *replication.ListenerContext) {
 * [Simple With Heartbeat](./example/simple-with-heartbeat)
 * [Snapshot Mode (Initial Data Capture)](./example/snapshotmode)
 * [Snapshot Only Mode (One-Time Export)](./example/snapshotonlymode)
-* [PostgreSQL to Elasticsearch](https://github.com/Trendyol/go-pq-cdc-elasticsearch/tree/main/example/simple)
+* [PostgreSQL to Elasticsearch](https://github.com/weiquanpeng/go-pg-dts-elasticsearch/tree/main/example/simple)
 * [PostgreSQL to Kafka](https://github.com/Trendyol/go-pq-cdc-kafka/tree/main/example/simple)
 * [PostgreSQL to PostgreSQL](./example/postgresql)
 
