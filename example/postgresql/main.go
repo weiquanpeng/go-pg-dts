@@ -15,14 +15,14 @@ import (
 
 	"github.com/weiquanpeng/go-pg-dts/pq"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	cdc "github.com/weiquanpeng/go-pg-dts"
 	"github.com/weiquanpeng/go-pg-dts/config"
 	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
 	"github.com/weiquanpeng/go-pg-dts/pq/publication"
 	"github.com/weiquanpeng/go-pg-dts/pq/replication"
 	"github.com/weiquanpeng/go-pg-dts/pq/slot"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Message 表示一个待执行的数据库操作
@@ -51,6 +51,7 @@ func main() {
 	var snapshotFlag string
 	var chunkSize int
 	var publicationName, slotName string
+	var heartbeatEnabled bool
 
 	flag.StringVar(&sourceDSN, "source", "", "源 PostgreSQL 连接 URL")
 	flag.StringVar(&targetDSN, "target", "", "目标 PostgreSQL 连接 URL")
@@ -60,6 +61,7 @@ func main() {
 	flag.StringVar(&publicationName, "publication", "cdc_publication", "源库 publication 名称")
 	// 该名字同时是快照任务的标识（cdc_snapshot_job.slot_name），换名会重新执行一次全量
 	flag.StringVar(&slotName, "slot", "cdc_slot", "源库复制槽名称，同时作为快照任务标识，同一实例内需唯一")
+	flag.BoolVar(&heartbeatEnabled, "heartbeat", true, "是否启用 CDC heartbeat（每 5 分钟更新一次）")
 	flag.Parse()
 
 	if sourceDSN == "" || targetDSN == "" {
@@ -114,6 +116,10 @@ func main() {
 			ClaimTimeout:      30 * time.Second,
 			HeartbeatInterval: 5 * time.Second,
 		},
+		Heartbeat: config.HeartbeatConfig{
+			Enabled:  heartbeatEnabled && !snapshotOnly,
+			Interval: 5 * time.Minute,
+		},
 		Metric: config.MetricConfig{
 			Port: metricPort,
 		},
@@ -130,11 +136,18 @@ func main() {
 	}
 	defer targetPool.Close()
 
+	if cfg.Heartbeat.Enabled {
+		if err := ensureTargetHeartbeatTable(ctx, targetPool); err != nil {
+			slog.Error("初始化目标端 heartbeat 表失败", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	loadPublicationTables(ctx, &cfg)
+	ensureTargetPrimaryKeys(ctx, targetPool, cfg.Publication.Tables)
 
 	// snapshot_only 模式取表走 Snapshot.Tables 分支，与 publication 无关。
-	// initial 模式必须保持 Snapshot.Tables 为空，否则 GetSnapshotTables 会切到
-	// validateSnapshotSubset 分支，在 publication 已存在且表集合不一致时直接报错。
+	// initial 模式由 Config.GetSnapshotTables 自动从全量表清单排除 cdc_heartbeat。
 	if snapshotOnly {
 		cfg.Snapshot.Tables = cfg.Publication.Tables
 		// 快照任务标识固定用 --slot，否则库会退化成 snapshot_only_<数据库名>
@@ -160,6 +173,16 @@ func main() {
 		<-produceDone
 		slog.Info("快照结束，残余数据已落盘")
 	}
+}
+
+func ensureTargetHeartbeatTable(ctx context.Context, conn *pgxpool.Pool) error {
+	_, err := conn.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS public.cdc_heartbeat (
+			id integer PRIMARY KEY,
+			updated_at timestamptz NOT NULL
+		)
+	`)
+	return err
 }
 
 // parseSnapshotFlag 解析 --snapshot 取值：
@@ -250,8 +273,25 @@ func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan
 	defer close(done)
 
 	queue := make([]pendingItem, 0, bulkSize)
-	ticker := time.NewTicker(100 * time.Millisecond)
+
+	// 攒不满一批时的兜底落盘只在通道空闲 idleFlush 之后触发。
+	// 无条件的固定周期 flush 会落在快照 worker 读取下一个分块的间隔里（分块越大间隔越长），
+	// 把攒到一半的队列切成碎批，导致大量远小于 bulkSize 的 COPY 和事务。
+	const idleFlush = time.Second
+	ticker := time.NewTicker(idleFlush / 4)
 	defer ticker.Stop()
+	lastRecv := time.Now()
+
+	flush := func(reason string) {
+		n := len(queue)
+		start := time.Now()
+		if err := flushBatch(ctx, w, queue); err != nil {
+			slog.Error("批量写入失败", "reason", reason, "error", err)
+			os.Exit(1)
+		}
+		queue = queue[:0]
+		slog.Info("目标端写入耗时", "duration_ms", time.Since(start).Milliseconds(), "batch_size", n, "reason", reason)
+	}
 
 	for {
 		select {
@@ -259,21 +299,24 @@ func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan
 			if !ok {
 				// 通道关闭且已取空，落盘最后不满一批的数据后退出
 				if len(queue) > 0 {
-					if err := flushBatch(ctx, w, queue); err != nil {
-						slog.Error("收尾批量写入失败", "error", err)
-						os.Exit(1)
-					}
-					slog.Info("收尾写入完成", "batch_size", len(queue))
+					flush("eof")
 				}
 				return
 			}
+			lastRecv = time.Now()
 
 			// 根据事件类型构建 SQL
 			sql, args, err := buildSQL(ctx, w, event)
 			if err != nil {
-				slog.Error("构建 SQL 失败", "table", event.Table, "action", event.Action, "error", err)
-				// 不确认该消息，导致 CDC 可能重试？这里简单跳过
-				continue
+				slog.Error("构建 SQL 失败，迁移终止",
+					"table", event.Table,
+					"action", event.Action,
+					"source", event.Source,
+					"error", err,
+				)
+				// 不能跳过该事件：后续事件成功 ACK 会跨过当前 WAL 位置，造成永久数据丢失。
+				// continue
+				os.Exit(1)
 			}
 			queue = append(queue, pendingItem{
 				query:  &pgx.QueuedQuery{SQL: sql, Arguments: args},
@@ -283,22 +326,12 @@ func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan
 			})
 
 			if len(queue) >= bulkSize {
-				startTarget := time.Now()
-				if err := flushBatch(ctx, w, queue); err != nil {
-					slog.Error("snapshot 批量写入失败", "error", err)
-					os.Exit(1)
-				}
-				slog.Info("目标端写入耗时", "duration_ms", time.Since(startTarget).Milliseconds(), "batch_size", len(queue))
-				queue = queue[:0]
+				flush("full")
 			}
 
 		case <-ticker.C:
-			if len(queue) > 0 {
-				if err := flushBatch(ctx, w, queue); err != nil {
-					slog.Error("cdc批量写入失败", "error", err)
-					os.Exit(1)
-				}
-				queue = queue[:0]
+			if len(queue) > 0 && time.Since(lastRecv) >= idleFlush {
+				flush("idle")
 			}
 		}
 	}
@@ -671,6 +704,27 @@ func getPrimaryKeys(ctx context.Context, conn *pgxpool.Pool, table string) ([]st
 	return pks, nil
 }
 
+// ensureTargetPrimaryKeys 在迁移开始前校验目标库每张表都有主键，缺一张就退出。
+// 放在启动阶段是因为写入路径依赖主键生成 UPSERT，等跑到那里才报错会先把一部分数据写进去。
+// 一次列出所有缺主键的表，避免一张一张试。
+func ensureTargetPrimaryKeys(ctx context.Context, conn *pgxpool.Pool, tables publication.Tables) {
+	var missing []string
+	for _, t := range tables {
+		full := t.Schema + "." + t.Name
+		if _, err := getPrimaryKeys(ctx, conn, full); err != nil {
+			missing = append(missing, fmt.Sprintf("%s (%v)", full, err))
+		}
+	}
+	if len(missing) > 0 {
+		slog.Error("目标库存在没有主键的表，迁移终止", "count", len(missing))
+		for _, m := range missing {
+			slog.Error("  缺少主键", "table", m)
+		}
+		os.Exit(1)
+	}
+	slog.Info("目标库主键校验通过", "tables", len(tables))
+}
+
 // parseSchemaTable 将 "schema.table" 拆分为 schema 和 table，默认为 public
 func parseSchemaTable(fullName string) (schema, table string) {
 	parts := strings.SplitN(fullName, ".", 2)
@@ -689,7 +743,7 @@ func loadPublicationTables(ctx context.Context, cfg *config.Config) {
 		os.Exit(1)
 	}
 	defer conn.Close(ctx)
-	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('UserReport');`
+	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('Conversation');`
 	pwq_tables := conn.Exec(ctx, query)
 	pwq_results, err := pwq_tables.ReadAll()
 	if err != nil {

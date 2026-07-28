@@ -614,9 +614,10 @@ func cloneStringSlice(in []string) []string {
 // createTableChunksWithConn divides a table into chunks using the specified connection.
 // If user specified a SnapshotPartitionStrategy in table config, use that directly.
 // Otherwise, auto-detect:
-//   - Priority 1: Integer Range (fastest for sequential integer PKs)
-//   - Priority 2: CTID Block (fast for any table)
-//   - Priority 3: Offset (slow fallback)
+//   - Priority 1: CTID Block (fast for any table)
+//   - Priority 2: Offset (slow fallback)
+//
+// Integer Range is no longer auto-selected; request it per table when needed.
 func (s *Snapshotter) createTableChunksWithConn(ctx context.Context, conn pq.Connection, slotName string, table publication.Table) []*Chunk {
 	// Check if user explicitly specified a partition strategy
 	if table.SnapshotPartitionStrategy != publication.SnapshotPartitionStrategyAuto {
@@ -673,18 +674,28 @@ func (s *Snapshotter) createChunksWithStrategyConn(ctx context.Context, conn pq.
 
 // createChunksAutoDetectConn auto-detects the best strategy based on PK type with given connection
 func (s *Snapshotter) createChunksAutoDetectConn(ctx context.Context, conn pq.Connection, slotName string, table publication.Table) []*Chunk {
-	// Strategy 1: Single integer PK - use range partitioning (fastest for sequential integer PKs)
-	pkColumn, ok, err := s.getSingleIntegerPrimaryKey(ctx, table)
-	if err != nil {
-		logger.Warn("[chunk] failed to inspect primary key", "table", table.Name, "error", err)
-	}
-
-	if ok {
-		if rangeChunks := s.createRangeChunksWithConn(ctx, conn, slotName, table, pkColumn); len(rangeChunks) > 0 {
-			return rangeChunks
-		}
-		logger.Warn("[chunk] range chunking unavailable, trying CTID", "table", table.Name)
-	}
+	// Strategy 1 is disabled for auto-detection.
+	//
+	// On PostgreSQL 14+ a bounded ctid predicate plans as a TID Range Scan, which reads each heap
+	// block exactly once with no index traversal and no sort, so it outperforms the ordered index
+	// scan that integer range chunks require for a full-table read. Range chunks are also split by
+	// key space rather than by row count, which yields enormous numbers of empty chunks whenever
+	// the key space is sparse.
+	//
+	// Tables that still need it can opt back in with snapshotPartitionStrategy: integer_range,
+	// which is handled by createChunksWithStrategyConn and unaffected by this block.
+	//
+	// pkColumn, ok, err := s.getSingleIntegerPrimaryKey(ctx, table)
+	// if err != nil {
+	// 	logger.Warn("[chunk] failed to inspect primary key", "table", table.Name, "error", err)
+	// }
+	//
+	// if ok {
+	// 	if rangeChunks := s.createRangeChunksWithConn(ctx, conn, slotName, table, pkColumn); len(rangeChunks) > 0 {
+	// 		return rangeChunks
+	// 	}
+	// 	logger.Warn("[chunk] range chunking unavailable, trying CTID", "table", table.Name)
+	// }
 
 	// Strategy 2: CTID block partitioning (works for any table, very fast)
 	if ctidChunks := s.createCTIDBlockChunksWithConn(ctx, conn, slotName, table); len(ctidChunks) > 0 {

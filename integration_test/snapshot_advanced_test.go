@@ -31,21 +31,26 @@ func TestSnapshotMultipleTables(t *testing.T) {
 	cdcCfg := Config
 	cdcCfg.Slot.Name = "slot_snapshot_multi_table"
 	cdcCfg.Publication.Name = "pub_snapshot_multi_table"
+	// Strategy is pinned because the 3+2+1 chunk split asserted below follows from
+	// row-count math. CTID chunking derives counts from physical block layout instead.
 	cdcCfg.Publication.Tables = publication.Tables{
 		{
-			Name:            usersTable,
-			Schema:          "public",
-			ReplicaIdentity: publication.ReplicaIdentityFull,
+			Name:                      usersTable,
+			Schema:                    "public",
+			ReplicaIdentity:           publication.ReplicaIdentityFull,
+			SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
 		},
 		{
-			Name:            ordersTable,
-			Schema:          "public",
-			ReplicaIdentity: publication.ReplicaIdentityFull,
+			Name:                      ordersTable,
+			Schema:                    "public",
+			ReplicaIdentity:           publication.ReplicaIdentityFull,
+			SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
 		},
 		{
-			Name:            productsTable,
-			Schema:          "public",
-			ReplicaIdentity: publication.ReplicaIdentityFull,
+			Name:                      productsTable,
+			Schema:                    "public",
+			ReplicaIdentity:           publication.ReplicaIdentityFull,
+			SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
 		},
 	}
 	cdcCfg.Snapshot.Enabled = true

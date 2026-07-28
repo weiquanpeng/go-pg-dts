@@ -32,6 +32,9 @@ func TestSnapshotMultipleChunks(t *testing.T) {
 			Name:            tableName,
 			Schema:          "public",
 			ReplicaIdentity: publication.ReplicaIdentityFull,
+			// Pinned because the chunk counts asserted below follow from row-count math.
+			// CTID chunking derives counts from physical block layout instead.
+			SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
 		},
 	}
 	cdcCfg.Snapshot.Enabled = true

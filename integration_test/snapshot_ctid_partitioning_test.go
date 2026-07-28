@@ -339,8 +339,9 @@ func TestSnapshotCTIDVsOffset(t *testing.T) {
 	})
 }
 
-// TestSnapshotIntegerPKStillUsesRange verifies that integer PK tables
-// still use the optimized range partitioning (not CTID)
+// TestSnapshotIntegerPKStillUsesRange verifies that an integer PK table uses range
+// partitioning when integer_range is explicitly requested. Auto-detection no longer
+// selects this strategy, so the table opts in through its config.
 func TestSnapshotIntegerPKStillUsesRange(t *testing.T) {
 	ctx := context.Background()
 
@@ -350,9 +351,10 @@ func TestSnapshotIntegerPKStillUsesRange(t *testing.T) {
 	cdcCfg.Publication.Name = "pub_snapshot_int_pk"
 	cdcCfg.Publication.Tables = publication.Tables{
 		{
-			Name:            tableName,
-			Schema:          "public",
-			ReplicaIdentity: publication.ReplicaIdentityFull,
+			Name:                      tableName,
+			Schema:                    "public",
+			ReplicaIdentity:           publication.ReplicaIdentityFull,
+			SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
 		},
 	}
 	cdcCfg.Snapshot.Enabled = true

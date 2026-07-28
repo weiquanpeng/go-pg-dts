@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/weiquanpeng/go-pg-dts/pq/publication"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/weiquanpeng/go-pg-dts/pq/publication"
 )
 
 func TestGetSnapshotTables(t *testing.T) {
@@ -184,6 +184,52 @@ func TestGetSnapshotTables(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "snapshot.tables must be specified for snapshot_only mode")
 	})
+
+	t.Run("should exclude heartbeat table from initial snapshot", func(t *testing.T) {
+		cfg := Config{
+			Heartbeat: HeartbeatConfig{Enabled: true},
+			Snapshot: SnapshotConfig{
+				Enabled: true,
+				Mode:    SnapshotModeInitial,
+			},
+		}
+		pubInfo := &publication.Config{
+			Tables: publication.Tables{
+				{Name: "orders", Schema: "public"},
+				{Name: HeartbeatTableName, Schema: HeartbeatTableSchema},
+			},
+		}
+
+		tables, err := cfg.GetSnapshotTables(pubInfo)
+
+		require.NoError(t, err)
+		require.Len(t, tables, 1)
+		assert.Equal(t, "orders", tables[0].Name)
+	})
+}
+
+func TestHeartbeatDefaults(t *testing.T) {
+	cfg := Config{
+		Heartbeat: HeartbeatConfig{Enabled: true},
+		Publication: publication.Config{
+			Tables: publication.Tables{
+				{Name: "orders", Schema: "public"},
+			},
+		},
+	}
+
+	cfg.SetDefault()
+
+	assert.Equal(t, 5*time.Minute, cfg.Heartbeat.Interval)
+	assert.Equal(t, HeartbeatDefaultQuery, cfg.Heartbeat.Query)
+	require.Len(t, cfg.Publication.Tables, 2)
+	assert.True(t, IsHeartbeatTable(
+		cfg.Publication.Tables[1].Schema,
+		cfg.Publication.Tables[1].Name,
+	))
+
+	cfg.SetDefault()
+	require.Len(t, cfg.Publication.Tables, 2, "SetDefault must not append heartbeat twice")
 }
 
 func TestMergePublicationTableConfig(t *testing.T) {

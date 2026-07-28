@@ -5,15 +5,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/segmentio/kafka-go"
 	cdc "github.com/weiquanpeng/go-pg-dts"
 	cdcconfig "github.com/weiquanpeng/go-pg-dts/config"
 	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
 	"github.com/weiquanpeng/go-pg-dts/pq/publication"
 	"github.com/weiquanpeng/go-pg-dts/pq/replication"
 	"github.com/weiquanpeng/go-pg-dts/pq/slot"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/segmentio/kafka-go"
 	"log/slog"
 	"os"
 	"strings"
@@ -36,10 +36,12 @@ const (
 func main() {
 	var sourceDSN, kafkaBrokers string
 	var metricPort int
+	var heartbeatEnabled bool
 	flag.StringVar(&sourceDSN, "source", "", "source postgres dsn")
 	flag.StringVar(&kafkaBrokers, "brokers", "127.0.0.1:9092", "kafka brokers")
 	flag.StringVar(&topicPrefix, "topic-prefix", "cdc", "kafka topic prefix")
 	flag.IntVar(&metricPort, "port", 2112, "metric port")
+	flag.BoolVar(&heartbeatEnabled, "heartbeat", true, "enable CDC heartbeat every 5 minutes")
 	flag.Parse()
 	if sourceDSN == "" {
 		slog.Error("missing --source")
@@ -96,8 +98,12 @@ func main() {
 			SlotActivityCheckerInterval: 3000,
 		},
 		Snapshot: cdcconfig.SnapshotConfig{Enabled: false},
-		Metric:   cdcconfig.MetricConfig{Port: metricPort},
-		Logger:   cdcconfig.LoggerConfig{LogLevel: slog.LevelInfo},
+		Heartbeat: cdcconfig.HeartbeatConfig{
+			Enabled:  heartbeatEnabled,
+			Interval: 5 * time.Minute,
+		},
+		Metric: cdcconfig.MetricConfig{Port: metricPort},
+		Logger: cdcconfig.LoggerConfig{LogLevel: slog.LevelInfo},
 	}
 	slog.Info("cdc tables loaded", "count", len(pubTables))
 	connector, err := cdc.NewConnector(ctx, cfg, Handler)
@@ -114,11 +120,17 @@ func Handler(ctx *replication.ListenerContext) {
 	var err error
 	switch msg := ctx.Message.(type) {
 	case *format.Insert:
-		err = writeKafkaMessage(context.Background(), msg.TableName, "insert", msg.Decoded)
+		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
+			err = writeKafkaMessage(context.Background(), msg.TableName, "insert", msg.Decoded)
+		}
 	case *format.Update:
-		err = writeKafkaMessage(context.Background(), msg.TableName, "update", msg.NewDecoded)
+		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
+			err = writeKafkaMessage(context.Background(), msg.TableName, "update", msg.NewDecoded)
+		}
 	case *format.Delete:
-		err = writeKafkaMessage(context.Background(), msg.TableName, "delete", msg.OldDecoded)
+		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
+			err = writeKafkaMessage(context.Background(), msg.TableName, "delete", msg.OldDecoded)
+		}
 	}
 	if err != nil {
 		slog.Error("write kafka failed permanently, exiting", "error", err)

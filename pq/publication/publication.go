@@ -3,11 +3,14 @@ package publication
 import (
 	"context"
 	goerrors "errors"
-	"github.com/weiquanpeng/go-pg-dts/logger"
-	"github.com/weiquanpeng/go-pg-dts/pq"
+	"fmt"
+
 	"github.com/go-playground/errors"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/weiquanpeng/go-pg-dts/logger"
+	"github.com/weiquanpeng/go-pg-dts/pq"
 	"strings"
 )
 
@@ -50,6 +53,38 @@ func (c *Publication) Create(ctx context.Context) (*Config, error) {
 	logger.Info("publication created", "name", c.cfg.Name)
 
 	return &c.cfg, nil
+}
+
+// EnsureTable adds a table to an existing publication when it is not already present.
+// It is idempotent for sequential process starts.
+func (c *Publication) EnsureTable(ctx context.Context, table Table) (*Config, error) {
+	info, err := c.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, existing := range info.Tables {
+		if existing.Schema == table.Schema && existing.Name == table.Name {
+			return info, nil
+		}
+	}
+
+	query := fmt.Sprintf(
+		"ALTER PUBLICATION %s ADD TABLE %s",
+		pgx.Identifier{c.cfg.Name}.Sanitize(),
+		pgx.Identifier{table.Schema, table.Name}.Sanitize(),
+	)
+	resultReader := c.conn.Exec(ctx, query)
+	if _, err = resultReader.ReadAll(); err != nil {
+		resultReader.Close()
+		return nil, errors.Wrap(err, "publication add table result")
+	}
+	if err = resultReader.Close(); err != nil {
+		return nil, errors.Wrap(err, "publication add table result reader close")
+	}
+
+	logger.Info("table added to publication", "publication", c.cfg.Name, "table", table.Schema+"."+table.Name)
+	return c.Info(ctx)
 }
 
 func (c *Publication) Info(ctx context.Context) (*Config, error) {

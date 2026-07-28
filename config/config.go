@@ -49,6 +49,22 @@ type HeartbeatConfig struct {
 	Enabled  bool          `json:"enabled" yaml:"enabled"`
 }
 
+const (
+	HeartbeatTableSchema  = "public"
+	HeartbeatTableName    = "cdc_heartbeat"
+	HeartbeatDefaultQuery = `INSERT INTO public.cdc_heartbeat(id, updated_at)
+VALUES (1, now())
+ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at`
+)
+
+// IsHeartbeatTable reports whether a relation is the internal CDC heartbeat table.
+func IsHeartbeatTable(schema, name string) bool {
+	if schema == "" {
+		schema = HeartbeatTableSchema
+	}
+	return schema == HeartbeatTableSchema && name == HeartbeatTableName
+}
+
 // DSN returns a normal PostgreSQL connection string for regular database operations
 // (publication, metadata, snapshot chunks, etc.)
 func (c *Config) DSN() string {
@@ -76,7 +92,26 @@ func (c *Config) SetDefault() {
 
 	// Default heartbeat interval if enabled but not set
 	if c.Heartbeat.Enabled && c.Heartbeat.Interval == 0 {
-		c.Heartbeat.Interval = 5 * time.Second
+		c.Heartbeat.Interval = 5 * time.Minute
+	}
+	if c.Heartbeat.Enabled && strings.TrimSpace(c.Heartbeat.Query) == "" {
+		c.Heartbeat.Query = HeartbeatDefaultQuery
+	}
+	if c.Heartbeat.Enabled && !c.IsSnapshotOnlyMode() {
+		hasHeartbeat := false
+		for _, table := range c.Publication.Tables {
+			if IsHeartbeatTable(table.Schema, table.Name) {
+				hasHeartbeat = true
+				break
+			}
+		}
+		if !hasHeartbeat {
+			c.Publication.Tables = append(c.Publication.Tables, publication.Table{
+				Name:            HeartbeatTableName,
+				Schema:          HeartbeatTableSchema,
+				ReplicaIdentity: publication.ReplicaIdentityDefault,
+			})
+		}
 	}
 
 	if c.Slot.SlotActivityCheckerInterval == 0 {
@@ -140,12 +175,24 @@ func (c *Config) GetSnapshotTables(publicationInfo *publication.Config) (publica
 	// Mode 2: initial (snapshot + CDC)
 	// If snapshot.tables specified, validate it's a subset of publication tables
 	if len(c.Snapshot.Tables) > 0 {
-		return c.validateSnapshotSubset(publicationInfo.Tables)
+		tables, err := c.validateSnapshotSubset(publicationInfo.Tables)
+		return withoutHeartbeatTable(tables), err
 	}
 
 	// Mode 3: initial with no snapshot.tables specified
 	// Use all tables from publication with merged user config (preserves SnapshotPartitionStrategy)
-	return c.mergePublicationTableConfig(publicationInfo.Tables), nil
+	return withoutHeartbeatTable(c.mergePublicationTableConfig(publicationInfo.Tables)), nil
+}
+
+func withoutHeartbeatTable(tables publication.Tables) publication.Tables {
+	filtered := make(publication.Tables, 0, len(tables))
+	for _, table := range tables {
+		if IsHeartbeatTable(table.Schema, table.Name) {
+			continue
+		}
+		filtered = append(filtered, table)
+	}
+	return filtered
 }
 
 // validateSnapshotSubset ensures snapshot.tables is a subset of publication tables

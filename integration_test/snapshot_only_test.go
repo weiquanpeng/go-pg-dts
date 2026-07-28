@@ -327,6 +327,9 @@ func TestSnapshotOnlyWithChunking(t *testing.T) {
 		{
 			Name:   tableName,
 			Schema: "public",
+			// Pinned because the 3-chunk split asserted below follows from row-count math.
+			// CTID chunking derives counts from physical block layout instead.
+			SnapshotPartitionStrategy: publication.SnapshotPartitionStrategyIntegerRange,
 		},
 	}
 	cdcCfg.Snapshot.Enabled = true

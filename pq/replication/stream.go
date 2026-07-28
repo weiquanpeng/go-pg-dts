@@ -9,6 +9,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/avast/retry-go/v4"
+	"github.com/go-playground/errors"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/weiquanpeng/go-pg-dts/config"
 	"github.com/weiquanpeng/go-pg-dts/internal/metric"
 	"github.com/weiquanpeng/go-pg-dts/internal/slice"
@@ -16,10 +20,6 @@ import (
 	"github.com/weiquanpeng/go-pg-dts/pq"
 	"github.com/weiquanpeng/go-pg-dts/pq/message"
 	"github.com/weiquanpeng/go-pg-dts/pq/message/format"
-	"github.com/avast/retry-go/v4"
-	"github.com/go-playground/errors"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 var (
@@ -217,10 +217,18 @@ func (s *stream) sink(ctx context.Context) {
 				continue
 			}
 
-			if pkm.ServerWALEnd > 0 {
-				s.UpdateXLogPos(pkm.ServerWALEnd)
-				logger.Debug("updated xlog position from keepalive", "serverWALEnd", pkm.ServerWALEnd.String())
-			}
+			// Keepalive 中的 ServerWALEnd 表示源库已经产生 WAL 的位置，不表示
+			// 下游已经成功持久化到该位置。lastXLogPos 只能由目标端提交后的 Ack 推进，
+			// 否则进程崩溃后复制槽可能从尚未落库的位置继续，造成数据丢失。
+			//
+			// if pkm.ServerWALEnd > 0 {
+			// 	s.UpdateXLogPos(pkm.ServerWALEnd)
+			// 	logger.Debug("updated xlog position from keepalive", "serverWALEnd", pkm.ServerWALEnd.String())
+			// }
+			logger.Debug("primary keepalive received",
+				"serverWALEnd", pkm.ServerWALEnd.String(),
+				"acknowledgedLSN", s.LoadXLogPos().String(),
+			)
 
 			if pkm.ReplyRequested {
 				if err = SendStandbyStatusUpdate(ctx, s.conn, uint64(s.LoadXLogPos())); err != nil {

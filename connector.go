@@ -17,6 +17,8 @@ import (
 
 	"github.com/weiquanpeng/go-pg-dts/pq/timescaledb"
 
+	"github.com/go-playground/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/weiquanpeng/go-pg-dts/config"
 	"github.com/weiquanpeng/go-pg-dts/internal/http"
 	"github.com/weiquanpeng/go-pg-dts/internal/metric"
@@ -25,8 +27,6 @@ import (
 	"github.com/weiquanpeng/go-pg-dts/pq/publication"
 	"github.com/weiquanpeng/go-pg-dts/pq/replication"
 	"github.com/weiquanpeng/go-pg-dts/pq/slot"
-	"github.com/go-playground/errors"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 type Connector interface {
@@ -91,6 +91,13 @@ func NewConnector(ctx context.Context, cfg config.Config, listenerFunc replicati
 	conn, err := pq.NewConnection(ctx, cfg.DSN())
 	if err != nil {
 		return nil, err
+	}
+
+	if cfg.Heartbeat.Enabled {
+		if err := ensureSourceHeartbeatTable(ctx, conn); err != nil {
+			conn.Close(ctx)
+			return nil, errors.Wrap(err, "initialize source heartbeat table")
+		}
 	}
 
 	publicationInfo, err := initializePublication(ctx, cfg, conn)
@@ -196,7 +203,33 @@ func initializePublication(ctx context.Context, cfg config.Config, conn pq.Conne
 	if err := pub.SetReplicaIdentities(ctx); err != nil {
 		return nil, err
 	}
-	return pub.Create(ctx)
+	info, err := pub.Create(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !cfg.Heartbeat.Enabled {
+		return info, nil
+	}
+
+	return pub.EnsureTable(ctx, publication.Table{
+		Name:            config.HeartbeatTableName,
+		Schema:          config.HeartbeatTableSchema,
+		ReplicaIdentity: publication.ReplicaIdentityDefault,
+	})
+}
+
+func ensureSourceHeartbeatTable(ctx context.Context, conn pq.Connection) error {
+	resultReader := conn.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS public.cdc_heartbeat (
+			id integer PRIMARY KEY,
+			updated_at timestamptz NOT NULL
+		)
+	`)
+	if _, err := resultReader.ReadAll(); err != nil {
+		resultReader.Close()
+		return err
+	}
+	return resultReader.Close()
 }
 
 // initializeSnapshot creates snapshot if enabled
