@@ -1,6 +1,6 @@
 {
-  "pid": 19525,
+  "pid": 42459,
   "version": "0.9.7",
   "socketPath": "/home/admin/go-pg-dts/.codegraph/daemon.sock",
-  "startedAt": 1785223352273
+  "startedAt": 1785829600593
 }

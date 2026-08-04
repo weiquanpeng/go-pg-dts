@@ -282,7 +282,28 @@ func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan
 	defer ticker.Stop()
 	lastRecv := time.Now()
 
+	// CDC 最多等待 100ms，避免持续有低流量事件时必须攒满 bulkSize 才落盘。
+	// 快照消息不会启动这个定时器，仍按满批或空闲 1 秒刷新，避免切碎 COPY。
+	const cdcFlushInterval = 100 * time.Millisecond
+	var cdcTimer *time.Timer
+	var cdcTimerC <-chan time.Time
+	stopCDCTimer := func() {
+		if cdcTimer == nil {
+			return
+		}
+		if !cdcTimer.Stop() {
+			select {
+			case <-cdcTimer.C:
+			default:
+			}
+		}
+		cdcTimer = nil
+		cdcTimerC = nil
+	}
+	defer stopCDCTimer()
+
 	flush := func(reason string) {
+		stopCDCTimer()
 		n := len(queue)
 		start := time.Now()
 		if err := flushBatch(ctx, w, queue); err != nil {
@@ -325,8 +346,18 @@ func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan
 				msg:    &event, // 新增
 			})
 
+			if event.Source == "cdc" && cdcTimer == nil {
+				cdcTimer = time.NewTimer(cdcFlushInterval)
+				cdcTimerC = cdcTimer.C
+			}
+
 			if len(queue) >= bulkSize {
 				flush("full")
+			}
+
+		case <-cdcTimerC:
+			if len(queue) > 0 {
+				flush("cdc_timeout")
 			}
 
 		case <-ticker.C:
@@ -363,16 +394,24 @@ func flushBatchGeneric(ctx context.Context, conn *pgxpool.Pool, items []pendingI
 		batch.QueuedQueries = append(batch.QueuedQueries, it.query)
 	}
 	br := conn.SendBatch(ctx, batch)
-	defer br.Close()
 
 	for i := 0; i < len(items); i++ {
 		if _, err := br.Exec(); err != nil {
+			_ = br.Close()
 			return fmt.Errorf("第 %d 条 SQL 失败: %w", i, err)
 		}
 	}
 
-	for _, it := range items {
-		it.ack()
+	// SendBatch 使用隐式事务。必须先 Close 并检查最终协议结果，确认整个目标批次
+	// 成功后才能推进源端 WAL；否则异常退出可能造成源端已 ACK、目标端未落盘。
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("结束批次失败: %w", err)
+	}
+
+	for i, it := range items {
+		if err := it.ack(); err != nil {
+			return fmt.Errorf("第 %d 条消息 ACK 失败: %w", i, err)
+		}
 	}
 
 	cdcCount := 0
@@ -743,7 +782,7 @@ func loadPublicationTables(ctx context.Context, cfg *config.Config) {
 		os.Exit(1)
 	}
 	defer conn.Close(ctx)
-	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('Conversation');`
+	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('ActionCardGenerationTask', 'AgentScriptGenTask', 'AxiomJobs', 'BatchRunJobs', 'BatchRunResults', 'BatchRunTasks', 'BranchesActionCard', 'BranchesAutoVideoGenConfig', 'BranchesAutoVideoGenRun', 'BranchesAutoVideoGenScript', 'BranchesChapter', 'BranchesConnection', 'BranchesCycle', 'BranchesEvalStandard', 'BranchesLayer', 'BranchesNode', 'BranchesNodeVersion', 'BranchesNodeVideo', 'BranchesNodeVideoComments', 'BranchesScript', 'BranchesScriptData', 'BranchesScriptEvaluationTask', 'BranchesScriptTag', 'BranchesScriptVersionHistory', 'BranchesSharedUnderwear', 'BranchesStyleLibrary', 'BranchesStyleLibraryTag', 'BranchesTagEnum', 'BranchesWorkflowConfigAuditLog', 'BranchesWorkflowConfigUsageLog', 'BranchesWorkflowConfigVersion', 'CapacityGrants', 'ChatAnalysisResult', 'ChatImageBatchGenerationResults', 'ChatImageBatchTasks', 'ConfigAccessControl', 'ContentAnalysisResult', 'ConversationSessionAnalysisResult', 'DailyChatAnalysisStat', 'DisplayModelParam', 'EloModelScore', 'EloSubmission', 'EmochiCorrelationReport', 'EmochiEval2Artifact', 'EmochiEval2CallLog', 'EmochiEval2Case', 'EmochiEval2CaseResult', 'EmochiEval2CaseTranslation', 'EmochiEval2CorrelationReport', 'EmochiEval2Dataset', 'EmochiEval2ModelScore', 'EmochiEval2Run', 'EmochiEval2TianjiCandidate', 'EmochiEval2TianjiIntakeOperation', 'EmochiEval2TianjiIntakeState', 'EmochiEval2TianjiReviewEvent', 'EmochiEval2TianjiSourceQuarantine', 'EmochiEvalCase', 'EmochiEvalCaseResult', 'EmochiEvalDataset', 'EmochiEvalRun', 'EmochiModelScore', 'EmochiNsfwCase', 'EmochiNsfwDataset', 'EmochiNsfwEvalCaseResult', 'EmochiNsfwEvalRun', 'EvalPipelineStep', 'EvalPipelineTask', 'FallbackChainStep', 'GPUHourCost', 'GpuAutoReleaseRules', 'GpuCards', 'GpuClusters', 'GpuInferenceServices', 'GpuJobs', 'ImageEditGenerationTask', 'ImageExperimentResult', 'ImageModelEvalComparison', 'ImageModelEvalTask', 'JudgeBatchJob', 'JudgeBatchTask', 'LLMJudgeConfig', 'LLMResponses', 'LLMTestResults', 'LLMTestSessions', 'LangfuseExportTask', 'MinorModerationLog', 'ModelCapability', 'ModelConfigTag', 'NarrativeMessageArtifact', 'NarrativeState', 'NsfwDataset', 'NsfwEvalJob', 'NsfwEvalResult', 'NsfwEvalTask', 'PromptManagerTag', 'RecallQuestionBank', 'RecallTestRun', 'SamplingBatch', 'SamplingTask', 'SamplingTaskLog', 'ScaleIntent', 'SessionEvalExperiment', 'SessionEvalExportTask', 'SessionEvalScore', 'SessionEvalSession', 'SessionEvalTurnEvent', 'StablityBenchmarkTasks', 'Tag', 'TagrmDataset', 'TagrmEvalJob', 'TagrmEvalResult', 'TagrmEvalTask', 'TraceCollectionCategory', 'TraceCollectionItem', 'TraceDebugSession', 'TrafficPlan', 'UserPagePermission', 'UserSamplingRecord', 'VideoBenchEvals', 'VideoBenchTasks', 'Workflow', 'branches_eval_config', 'usage_logs');`
 	pwq_tables := conn.Exec(ctx, query)
 	pwq_results, err := pwq_tables.ReadAll()
 	if err != nil {
