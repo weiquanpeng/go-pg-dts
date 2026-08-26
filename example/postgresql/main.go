@@ -52,6 +52,7 @@ func main() {
 	var chunkSize int
 	var publicationName, slotName string
 	var heartbeatEnabled bool
+	var overrideTable string
 
 	flag.StringVar(&sourceDSN, "source", "", "源 PostgreSQL 连接 URL")
 	flag.StringVar(&targetDSN, "target", "", "目标 PostgreSQL 连接 URL")
@@ -62,6 +63,9 @@ func main() {
 	// 该名字同时是快照任务的标识（cdc_snapshot_job.slot_name），换名会重新执行一次全量
 	flag.StringVar(&slotName, "slot", "cdc_slot", "源库复制槽名称，同时作为快照任务标识，同一实例内需唯一")
 	flag.BoolVar(&heartbeatEnabled, "heartbeat", true, "是否启用 CDC heartbeat（每 5 分钟更新一次）")
+	// 分区表反向同步场景：源端是若干分区叶子表，目标端只有一张单表，表名对不上，
+	// 用该参数把所有 CDC 事件（cdc_heartbeat 除外）统一改写到指定表
+	flag.StringVar(&overrideTable, "override-table", "", "非空时所有 CDC 事件写入该表（cdc_heartbeat 除外），仅支持 --snapshot=false")
 	flag.Parse()
 
 	if sourceDSN == "" || targetDSN == "" {
@@ -77,6 +81,12 @@ func main() {
 		os.Exit(1)
 	}
 	snapshotOnly := snapshotMode == config.SnapshotModeSnapshotOnly
+
+	// 快照事件不走改写逻辑，带全量跑会把快照数据按源端（分区）表名写目标端，直接拦掉
+	if overrideTable != "" && snapshotEnabled {
+		fmt.Fprintf(os.Stderr, "错误: --override-table 仅支持纯增量模式，请配合 --snapshot=false 使用\n")
+		os.Exit(1)
+	}
 
 	ctx := context.Background()
 
@@ -144,7 +154,14 @@ func main() {
 	}
 
 	loadPublicationTables(ctx, &cfg)
-	ensureTargetPrimaryKeys(ctx, targetPool, cfg.Publication.Tables)
+	if overrideTable != "" {
+		// 反向链路：目标端只有 override 这张单表，源端的分区表名在目标端不存在，
+		// 主键校验只针对实际写入的表
+		schema, name := parseSchemaTable(overrideTable)
+		ensureTargetPrimaryKeys(ctx, targetPool, publication.Tables{{Name: name, Schema: schema}})
+	} else {
+		ensureTargetPrimaryKeys(ctx, targetPool, cfg.Publication.Tables)
+	}
 
 	// snapshot_only 模式取表走 Snapshot.Tables 分支，与 publication 无关。
 	// initial 模式由 Config.GetSnapshotTables 自动从全量表清单排除 cdc_heartbeat。
@@ -158,7 +175,7 @@ func main() {
 	produceDone := make(chan struct{})
 	go Produce(ctx, targetPool, chunkSize, messages, produceDone)
 
-	connector, err := cdc.NewConnector(ctx, cfg, FilteredMapper(messages))
+	connector, err := cdc.NewConnector(ctx, cfg, FilteredMapper(messages, overrideTable))
 	if err != nil {
 		slog.Error("创建 CDC 连接器失败", "error", err)
 		os.Exit(1)
@@ -202,13 +219,21 @@ func parseSnapshotFlag(v string) (enabled bool, mode config.SnapshotMode, err er
 	}
 }
 
-// FilteredMapper 将 CDC 事件转换为通用 Message
-func FilteredMapper(messages chan Message) replication.ListenerFunc {
+// FilteredMapper 将 CDC 事件转换为通用 Message。
+// overrideTable 非空时，所有 CDC 事件统一写入该表（分区表反向同步回单表的场景）；
+// cdc_heartbeat 不参与改写，照旧写目标端同名表，否则心跳 upsert 会打到业务表上因列不匹配而终止迁移。
+func FilteredMapper(messages chan Message, overrideTable string) replication.ListenerFunc {
+	resolveTable := func(namespace, name string) string {
+		if overrideTable == "" || config.IsHeartbeatTable(namespace, name) {
+			return name
+		}
+		return overrideTable
+	}
 	return func(ctx *replication.ListenerContext) {
 		switch msg := ctx.Message.(type) {
 		case *format.Insert:
 			messages <- Message{
-				Table:  msg.TableName,
+				Table:  resolveTable(msg.TableNamespace, msg.TableName),
 				Action: "insert",
 				Data:   msg.Decoded,
 				Ack:    ctx.Ack,
@@ -216,7 +241,7 @@ func FilteredMapper(messages chan Message) replication.ListenerFunc {
 			}
 		case *format.Update:
 			messages <- Message{
-				Table:   msg.TableName,
+				Table:   resolveTable(msg.TableNamespace, msg.TableName),
 				Action:  "update",
 				Data:    msg.NewDecoded,
 				OldData: msg.OldDecoded,
@@ -225,7 +250,7 @@ func FilteredMapper(messages chan Message) replication.ListenerFunc {
 			}
 		case *format.Delete:
 			messages <- Message{
-				Table:   msg.TableName,
+				Table:   resolveTable(msg.TableNamespace, msg.TableName),
 				Action:  "delete",
 				OldData: msg.OldDecoded,
 				Ack:     ctx.Ack,
