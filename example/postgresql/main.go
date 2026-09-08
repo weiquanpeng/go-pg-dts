@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"github.com/weiquanpeng/go-pg-dts/pq"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	cdc "github.com/weiquanpeng/go-pg-dts"
 	"github.com/weiquanpeng/go-pg-dts/config"
@@ -52,7 +54,7 @@ func main() {
 	var chunkSize int
 	var publicationName, slotName string
 	var heartbeatEnabled bool
-	var overrideTable string
+	var publishViaPartitionRoot bool
 
 	flag.StringVar(&sourceDSN, "source", "", "源 PostgreSQL 连接 URL")
 	flag.StringVar(&targetDSN, "target", "", "目标 PostgreSQL 连接 URL")
@@ -63,9 +65,9 @@ func main() {
 	// 该名字同时是快照任务的标识（cdc_snapshot_job.slot_name），换名会重新执行一次全量
 	flag.StringVar(&slotName, "slot", "cdc_slot", "源库复制槽名称，同时作为快照任务标识，同一实例内需唯一")
 	flag.BoolVar(&heartbeatEnabled, "heartbeat", true, "是否启用 CDC heartbeat（每 5 分钟更新一次）")
-	// 分区表反向同步场景：源端是若干分区叶子表，目标端只有一张单表，表名对不上，
-	// 用该参数把所有 CDC 事件（cdc_heartbeat 除外）统一改写到指定表
-	flag.StringVar(&overrideTable, "override-table", "", "非空时所有 CDC 事件写入该表（cdc_heartbeat 除外），仅支持 --snapshot=false")
+	// 分区表订阅场景（如反向同步）：白名单只需写分区父表，publication 以父表名义发布事件，
+	// 启动时自动把父表下所有叶子分区设为 REPLICA IDENTITY FULL（需源端 PG 13+）
+	flag.BoolVar(&publishViaPartitionRoot, "publish-via-partition-root", false, "以分区父表名义发布 CDC 事件，仅支持 --snapshot=false")
 	flag.Parse()
 
 	if sourceDSN == "" || targetDSN == "" {
@@ -82,9 +84,9 @@ func main() {
 	}
 	snapshotOnly := snapshotMode == config.SnapshotModeSnapshotOnly
 
-	// 快照事件不走改写逻辑，带全量跑会把快照数据按源端（分区）表名写目标端，直接拦掉
-	if overrideTable != "" && snapshotEnabled {
-		fmt.Fprintf(os.Stderr, "错误: --override-table 仅支持纯增量模式，请配合 --snapshot=false 使用\n")
+	// 快照分块逻辑不支持分区父表（父表无存储、无法做 CTID 扫描），该模式仅用于纯增量
+	if publishViaPartitionRoot && snapshotEnabled {
+		fmt.Fprintf(os.Stderr, "错误: --publish-via-partition-root 仅支持纯增量模式，请配合 --snapshot=false 使用\n")
 		os.Exit(1)
 	}
 
@@ -105,8 +107,9 @@ func main() {
 		Password: srcConnConfig.Password,
 		Database: srcConnConfig.Database,
 		Publication: publication.Config{
-			CreateIfNotExists: true,
-			Name:              publicationName,
+			CreateIfNotExists:       true,
+			Name:                    publicationName,
+			PublishViaPartitionRoot: publishViaPartitionRoot,
 			Operations: publication.Operations{
 				publication.OperationInsert,
 				publication.OperationDelete,
@@ -154,14 +157,7 @@ func main() {
 	}
 
 	loadPublicationTables(ctx, &cfg)
-	if overrideTable != "" {
-		// 反向链路：目标端只有 override 这张单表，源端的分区表名在目标端不存在，
-		// 主键校验只针对实际写入的表
-		schema, name := parseSchemaTable(overrideTable)
-		ensureTargetPrimaryKeys(ctx, targetPool, publication.Tables{{Name: name, Schema: schema}})
-	} else {
-		ensureTargetPrimaryKeys(ctx, targetPool, cfg.Publication.Tables)
-	}
+	ensureTargetPrimaryKeys(ctx, targetPool, cfg.Publication.Tables)
 
 	// snapshot_only 模式取表走 Snapshot.Tables 分支，与 publication 无关。
 	// initial 模式由 Config.GetSnapshotTables 自动从全量表清单排除 cdc_heartbeat。
@@ -175,7 +171,7 @@ func main() {
 	produceDone := make(chan struct{})
 	go Produce(ctx, targetPool, chunkSize, messages, produceDone)
 
-	connector, err := cdc.NewConnector(ctx, cfg, FilteredMapper(messages, overrideTable))
+	connector, err := cdc.NewConnector(ctx, cfg, FilteredMapper(messages))
 	if err != nil {
 		slog.Error("创建 CDC 连接器失败", "error", err)
 		os.Exit(1)
@@ -219,21 +215,13 @@ func parseSnapshotFlag(v string) (enabled bool, mode config.SnapshotMode, err er
 	}
 }
 
-// FilteredMapper 将 CDC 事件转换为通用 Message。
-// overrideTable 非空时，所有 CDC 事件统一写入该表（分区表反向同步回单表的场景）；
-// cdc_heartbeat 不参与改写，照旧写目标端同名表，否则心跳 upsert 会打到业务表上因列不匹配而终止迁移。
-func FilteredMapper(messages chan Message, overrideTable string) replication.ListenerFunc {
-	resolveTable := func(namespace, name string) string {
-		if overrideTable == "" || config.IsHeartbeatTable(namespace, name) {
-			return name
-		}
-		return overrideTable
-	}
+// FilteredMapper 将 CDC 事件转换为通用 Message
+func FilteredMapper(messages chan Message) replication.ListenerFunc {
 	return func(ctx *replication.ListenerContext) {
 		switch msg := ctx.Message.(type) {
 		case *format.Insert:
 			messages <- Message{
-				Table:  resolveTable(msg.TableNamespace, msg.TableName),
+				Table:  msg.TableName,
 				Action: "insert",
 				Data:   msg.Decoded,
 				Ack:    ctx.Ack,
@@ -241,7 +229,7 @@ func FilteredMapper(messages chan Message, overrideTable string) replication.Lis
 			}
 		case *format.Update:
 			messages <- Message{
-				Table:   resolveTable(msg.TableNamespace, msg.TableName),
+				Table:   msg.TableName,
 				Action:  "update",
 				Data:    msg.NewDecoded,
 				OldData: msg.OldDecoded,
@@ -250,7 +238,7 @@ func FilteredMapper(messages chan Message, overrideTable string) replication.Lis
 			}
 		case *format.Delete:
 			messages <- Message{
-				Table:   resolveTable(msg.TableNamespace, msg.TableName),
+				Table:   msg.TableName,
 				Action:  "delete",
 				OldData: msg.OldDecoded,
 				Ack:     ctx.Ack,
@@ -451,14 +439,36 @@ func flushBatchGeneric(ctx context.Context, conn *pgxpool.Pool, items []pendingI
 	return nil
 }
 
-// 快照专用 COPY + 事务（比多行 INSERT 更快）
+// 快照专用 COPY + 事务（比多行 INSERT 更快）。
+// COPY 撞到主键冲突（23505）时回退为逐行 INSERT ... ON CONFLICT DO NOTHING：
+// 重复行可能来自 chunk 重投或 CDC 已先写入同一行的更新版本，必须保留已有行
+// （DO UPDATE 会用旧快照覆盖 CDC 的新值，造成数据回退），缺失的行补上。
+// 正常无冲突时不会走回退路径，没有额外开销。
 func flushBatchSnapshotMultiRow(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) error {
+	// 缺少原始消息时无法走 COPY / 幂等重放，整批交给通用 upsert 路径。
+	// 这里统一判定，避免下游两条路径各自回退导致同一批被执行两次。
+	for _, it := range items {
+		if it.msg == nil {
+			return flushBatchGeneric(ctx, conn, items)
+		}
+	}
+
+	err := flushBatchSnapshotCopy(ctx, conn, items)
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return err
+	}
+	slog.Warn("快照 COPY 撞到主键冲突，回退为幂等写入", "batch_size", len(items), "detail", pgErr.Message)
+	return flushBatchSnapshotDoNothing(ctx, conn, items)
+}
+
+func flushBatchSnapshotCopy(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) error {
 	// 按表分组
 	groups := make(map[string][]*Message)
 	for _, it := range items {
-		if it.msg == nil {
-			return flushBatchGeneric(ctx, conn, items) // fallback
-		}
 		groups[it.msg.Table] = append(groups[it.msg.Table], it.msg)
 	}
 
@@ -542,6 +552,40 @@ func flushBatchSnapshotMultiRow(ctx context.Context, conn *pgxpool.Pool, items [
 	return nil
 }
 
+// flushBatchSnapshotDoNothing 用逐行 INSERT ... ON CONFLICT DO NOTHING 重放一批快照行。
+// 仅在 COPY 撞到重复行（23505）时被调用。inserted/skipped 日志用于诊断重复来源：
+// 几乎全 skipped 说明是重投或 CDC 已写入；大量 inserted 说明目标端残留了部分旧数据。
+func flushBatchSnapshotDoNothing(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) error {
+	batch := &pgx.Batch{}
+	for _, it := range items {
+		sql, args, err := buildInsertDoNothingSQL(ctx, conn, it.msg.Table, it.msg.Data)
+		if err != nil {
+			return fmt.Errorf("构建幂等插入 SQL 失败: %w", err)
+		}
+		batch.Queue(sql, args...)
+	}
+
+	br := conn.SendBatch(ctx, batch)
+	inserted := 0
+	for i := 0; i < len(items); i++ {
+		ct, err := br.Exec()
+		if err != nil {
+			_ = br.Close()
+			return fmt.Errorf("幂等写入第 %d 条失败: %w", i, err)
+		}
+		inserted += int(ct.RowsAffected())
+	}
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("结束幂等写入批次失败: %w", err)
+	}
+
+	for _, it := range items {
+		_ = it.ack()
+	}
+	slog.Warn("快照幂等回退完成", "batch_size", len(items), "inserted", inserted, "skipped", len(items)-inserted)
+	return nil
+}
+
 // 辅助函数：获取排序后的列名切片
 func getSortedColumns(data map[string]interface{}) []string {
 	cols := make([]string, 0, len(data))
@@ -599,6 +643,15 @@ func getColumnTypes(ctx context.Context, conn *pgxpool.Pool, table string) (map[
 
 // buildUpsertSQL 生成 INSERT ... ON CONFLICT ... DO UPDATE 语句
 func buildUpsertSQL(ctx context.Context, conn *pgxpool.Pool, table string, data map[string]interface{}) (string, []interface{}, error) {
+	return buildInsertOnConflictSQL(ctx, conn, table, data, true)
+}
+
+// buildInsertDoNothingSQL 生成 INSERT ... ON CONFLICT DO NOTHING 语句（快照幂等回退用）
+func buildInsertDoNothingSQL(ctx context.Context, conn *pgxpool.Pool, table string, data map[string]interface{}) (string, []interface{}, error) {
+	return buildInsertOnConflictSQL(ctx, conn, table, data, false)
+}
+
+func buildInsertOnConflictSQL(ctx context.Context, conn *pgxpool.Pool, table string, data map[string]interface{}, doUpdate bool) (string, []interface{}, error) {
 	pks, err := getPrimaryKeys(ctx, conn, table)
 	if err != nil {
 		return "", nil, err
@@ -639,19 +692,22 @@ func buildUpsertSQL(ctx context.Context, conn *pgxpool.Pool, table string, data 
 
 	// 构建 INSERT 部分
 	sql := fmt.Sprintf(
-		"INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s) DO UPDATE SET ",
+		"INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (%s)",
 		quotedTable,
 		strings.Join(quotedColumns, ", "),
 		strings.Join(placeholders, ", "),
 		conflictCols,
 	)
 
-	// SET 子句
-	sets := make([]string, len(quotedColumns))
-	for i, col := range quotedColumns {
-		sets[i] = fmt.Sprintf("%s = EXCLUDED.%s", col, col)
+	if doUpdate {
+		sets := make([]string, len(quotedColumns))
+		for i, col := range quotedColumns {
+			sets[i] = fmt.Sprintf("%s = EXCLUDED.%s", col, col)
+		}
+		sql += " DO UPDATE SET " + strings.Join(sets, ", ")
+	} else {
+		sql += " DO NOTHING"
 	}
-	sql += strings.Join(sets, ", ")
 
 	// 参数
 	colTypes, err := getColumnTypes(ctx, conn, table)
@@ -807,7 +863,7 @@ func loadPublicationTables(ctx context.Context, cfg *config.Config) {
 		os.Exit(1)
 	}
 	defer conn.Close(ctx)
-	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('ActionCardGenerationTask', 'AgentScriptGenTask', 'AxiomJobs', 'BatchRunJobs', 'BatchRunResults', 'BatchRunTasks', 'BranchesActionCard', 'BranchesAutoVideoGenConfig', 'BranchesAutoVideoGenRun', 'BranchesAutoVideoGenScript', 'BranchesChapter', 'BranchesConnection', 'BranchesCycle', 'BranchesEvalStandard', 'BranchesLayer', 'BranchesNode', 'BranchesNodeVersion', 'BranchesNodeVideo', 'BranchesNodeVideoComments', 'BranchesScript', 'BranchesScriptData', 'BranchesScriptEvaluationTask', 'BranchesScriptTag', 'BranchesScriptVersionHistory', 'BranchesSharedUnderwear', 'BranchesStyleLibrary', 'BranchesStyleLibraryTag', 'BranchesTagEnum', 'BranchesWorkflowConfigAuditLog', 'BranchesWorkflowConfigUsageLog', 'BranchesWorkflowConfigVersion', 'CapacityGrants', 'ChatAnalysisResult', 'ChatImageBatchGenerationResults', 'ChatImageBatchTasks', 'ConfigAccessControl', 'ContentAnalysisResult', 'ConversationSessionAnalysisResult', 'DailyChatAnalysisStat', 'DisplayModelParam', 'EloModelScore', 'EloSubmission', 'EmochiCorrelationReport', 'EmochiEval2Artifact', 'EmochiEval2CallLog', 'EmochiEval2Case', 'EmochiEval2CaseResult', 'EmochiEval2CaseTranslation', 'EmochiEval2CorrelationReport', 'EmochiEval2Dataset', 'EmochiEval2ModelScore', 'EmochiEval2Run', 'EmochiEval2TianjiCandidate', 'EmochiEval2TianjiIntakeOperation', 'EmochiEval2TianjiIntakeState', 'EmochiEval2TianjiReviewEvent', 'EmochiEval2TianjiSourceQuarantine', 'EmochiEvalCase', 'EmochiEvalCaseResult', 'EmochiEvalDataset', 'EmochiEvalRun', 'EmochiModelScore', 'EmochiNsfwCase', 'EmochiNsfwDataset', 'EmochiNsfwEvalCaseResult', 'EmochiNsfwEvalRun', 'EvalPipelineStep', 'EvalPipelineTask', 'FallbackChainStep', 'GPUHourCost', 'GpuAutoReleaseRules', 'GpuCards', 'GpuClusters', 'GpuInferenceServices', 'GpuJobs', 'ImageEditGenerationTask', 'ImageExperimentResult', 'ImageModelEvalComparison', 'ImageModelEvalTask', 'JudgeBatchJob', 'JudgeBatchTask', 'LLMJudgeConfig', 'LLMResponses', 'LLMTestResults', 'LLMTestSessions', 'LangfuseExportTask', 'MinorModerationLog', 'ModelCapability', 'ModelConfigTag', 'NarrativeMessageArtifact', 'NarrativeState', 'NsfwDataset', 'NsfwEvalJob', 'NsfwEvalResult', 'NsfwEvalTask', 'PromptManagerTag', 'RecallQuestionBank', 'RecallTestRun', 'SamplingBatch', 'SamplingTask', 'SamplingTaskLog', 'ScaleIntent', 'SessionEvalExperiment', 'SessionEvalExportTask', 'SessionEvalScore', 'SessionEvalSession', 'SessionEvalTurnEvent', 'StablityBenchmarkTasks', 'Tag', 'TagrmDataset', 'TagrmEvalJob', 'TagrmEvalResult', 'TagrmEvalTask', 'TraceCollectionCategory', 'TraceCollectionItem', 'TraceDebugSession', 'TrafficPlan', 'UserPagePermission', 'UserSamplingRecord', 'VideoBenchEvals', 'VideoBenchTasks', 'Workflow', 'branches_eval_config', 'usage_logs');`
+	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('PromptImageHistory');`
 	pwq_tables := conn.Exec(ctx, query)
 	pwq_results, err := pwq_tables.ReadAll()
 	if err != nil {

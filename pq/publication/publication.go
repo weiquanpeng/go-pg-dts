@@ -37,6 +37,9 @@ func (c *Publication) Create(ctx context.Context) (*Config, error) {
 		}
 	} else {
 		logger.Warn("publication already exists")
+		if c.cfg.PublishViaPartitionRoot {
+			c.warnIfNotViaPartitionRoot(ctx)
+		}
 		return info, nil
 	}
 
@@ -53,6 +56,25 @@ func (c *Publication) Create(ctx context.Context) (*Config, error) {
 	logger.Info("publication created", "name", c.cfg.Name)
 
 	return &c.cfg, nil
+}
+
+// warnIfNotViaPartitionRoot logs a warning when publish_via_partition_root is requested
+// but the pre-existing publication was created without it. Create() reuses existing
+// publications as-is, so the option would silently have no effect otherwise.
+func (c *Publication) warnIfNotViaPartitionRoot(ctx context.Context) {
+	query := fmt.Sprintf("SELECT pubviaroot FROM pg_publication WHERE pubname = '%s'", c.cfg.Name)
+	resultReader := c.conn.Exec(ctx, query)
+	results, err := resultReader.ReadAll()
+	_ = resultReader.Close()
+	if err != nil || len(results) == 0 || len(results[0].Rows) == 0 {
+		return
+	}
+	if string(results[0].Rows[0][0]) != "t" {
+		logger.Warn("existing publication was created WITHOUT publish_via_partition_root: "+
+			"changes will still be published with leaf partition names. "+
+			"Recreate it or run: ALTER PUBLICATION ... SET (publish_via_partition_root = true)",
+			"publication", c.cfg.Name)
+	}
 }
 
 // EnsureTable adds a table to an existing publication when it is not already present.

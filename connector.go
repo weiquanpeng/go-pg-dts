@@ -279,6 +279,16 @@ func (c *connector) Start(ctx context.Context) {
 				logger.Info("[connector] snapshot transaction committed, moving to CDC phase")
 			}
 		}
+		// chunk"完成"只代表行已读入内存队列，落盘目标端是异步的（本实例和其它并发
+		// 实例都是）。等待 60s 让所有实例把残余快照数据写完再开 CDC，避免 CDC 的
+		// upsert 抢先写入同一行、导致别的实例的快照 COPY 撞主键。
+		// 队列排干正常只需 1~2s，60s 是刻意的冗余。
+		logger.Info("[connector] waiting 60s for all instances to flush snapshot data before starting CDC")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(60 * time.Second):
+		}
 	} else {
 		// No snapshot: Create slot normally before starting CDC
 		logger.Info("creating replication slot for CDC")

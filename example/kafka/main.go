@@ -25,7 +25,6 @@ var (
 	kafkaWriter     *kafka.Writer
 	pgPool          *pgxpool.Pool
 	topicPrefix     string
-	overrideTable   string
 	primaryKeyCache sync.Map
 )
 
@@ -38,13 +37,15 @@ func main() {
 	var sourceDSN, kafkaBrokers string
 	var metricPort int
 	var heartbeatEnabled bool
+	var publishViaPartitionRoot bool
 	flag.StringVar(&sourceDSN, "source", "", "source postgres dsn")
 	flag.StringVar(&kafkaBrokers, "brokers", "127.0.0.1:9092", "kafka brokers")
 	flag.StringVar(&topicPrefix, "topic-prefix", "cdc", "kafka topic prefix")
 	flag.IntVar(&metricPort, "port", 2112, "metric port")
 	flag.BoolVar(&heartbeatEnabled, "heartbeat", true, "enable CDC heartbeat every 5 minutes")
-	// 分区表场景：把所有分区叶子表的 CDC 事件统一按该表名发送（topic、header、key 均使用该名字）
-	flag.StringVar(&overrideTable, "override-table", "", "override table name for all CDC events")
+	// 分区表场景：白名单只需写分区父表，publication 以父表名义发布事件，
+	// 启动时自动把父表下所有叶子分区设为 REPLICA IDENTITY FULL（需源端 PG 13+）
+	flag.BoolVar(&publishViaPartitionRoot, "publish-via-partition-root", false, "以分区父表名义发布 CDC 事件")
 	flag.Parse()
 	if sourceDSN == "" {
 		slog.Error("missing --source")
@@ -68,15 +69,6 @@ func main() {
 		slog.Error("load tables failed", "error", err)
 		os.Exit(1)
 	}
-	// 消息 key 按 override 后的表名去源库查主键，同名分区父表能查到；
-	// 查不到说明源库没有这张表，启动时直接报错退出，避免静默发出 nil key
-	if overrideTable != "" {
-		pks, err := getPrimaryKeys(ctx, overrideTable)
-		if err != nil || len(pks) == 0 {
-			slog.Error("override table has no primary key on source database", "table", overrideTable, "error", err)
-			os.Exit(1)
-		}
-	}
 	kafkaWriter = &kafka.Writer{
 		Addr:                   kafka.TCP(strings.Split(kafkaBrokers, ",")...),
 		AllowAutoTopicCreation: true,
@@ -95,8 +87,9 @@ func main() {
 		Database:  srcConnConfig.Database,
 		DebugMode: false,
 		Publication: publication.Config{
-			CreateIfNotExists: true,
-			Name:              "pg_cdc_kafka",
+			CreateIfNotExists:       true,
+			Name:                    "pg_cdc_kafka",
+			PublishViaPartitionRoot: publishViaPartitionRoot,
 			Operations: publication.Operations{
 				publication.OperationInsert,
 				publication.OperationUpdate,
@@ -133,15 +126,15 @@ func Handler(ctx *replication.ListenerContext) {
 	switch msg := ctx.Message.(type) {
 	case *format.Insert:
 		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
-			err = writeKafkaMessage(context.Background(), targetTableName(msg.TableName), "insert", msg.Decoded)
+			err = writeKafkaMessage(context.Background(), msg.TableName, "insert", msg.Decoded)
 		}
 	case *format.Update:
 		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
-			err = writeKafkaMessage(context.Background(), targetTableName(msg.TableName), "update", msg.NewDecoded)
+			err = writeKafkaMessage(context.Background(), msg.TableName, "update", msg.NewDecoded)
 		}
 	case *format.Delete:
 		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
-			err = writeKafkaMessage(context.Background(), targetTableName(msg.TableName), "delete", msg.OldDecoded)
+			err = writeKafkaMessage(context.Background(), msg.TableName, "delete", msg.OldDecoded)
 		}
 	}
 	if err != nil {
@@ -152,15 +145,6 @@ func Handler(ctx *replication.ListenerContext) {
 	if err := ctx.Ack(); err != nil {
 		slog.Error("ack failed", "error", err)
 	}
-}
-
-// targetTableName 返回事件实际使用的表名，--override-table 非空时统一替换。
-// heartbeat 事件在 Handler 里已被过滤，不会走到这里。
-func targetTableName(name string) string {
-	if overrideTable != "" {
-		return overrideTable
-	}
-	return name
 }
 
 func writeKafkaMessage(ctx context.Context, table, operation string, payload map[string]interface{}) error {

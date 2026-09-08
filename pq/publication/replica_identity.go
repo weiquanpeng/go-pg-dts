@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/weiquanpeng/go-pg-dts/logger"
 	"github.com/go-playground/errors"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/weiquanpeng/go-pg-dts/logger"
 )
 
 const (
@@ -30,6 +31,15 @@ func (c *Publication) SetReplicaIdentities(ctx context.Context) error {
 		return nil
 	}
 
+	// publish_via_partition_root mode: logical decoding reads old tuples based on the
+	// LEAF partitions' replica identity, and ALTER on the partitioned parent does not
+	// recurse, so each leaf must be aligned individually before the normal path below.
+	if c.cfg.PublishViaPartitionRoot {
+		if err := c.setLeafPartitionReplicaIdentities(ctx); err != nil {
+			return err
+		}
+	}
+
 	tables, err := c.GetReplicaIdentities(ctx)
 	if err != nil {
 		return err
@@ -40,6 +50,59 @@ func (c *Publication) SetReplicaIdentities(ctx context.Context) error {
 	for _, d := range diff {
 		if err = c.AlterTableReplicaIdentity(ctx, d); err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+// setLeafPartitionReplicaIdentities expands each configured table into its leaf
+// partitions (via pg_partition_tree, PG 12+) and aligns every leaf's replica identity
+// with the configured one. Regular (non-partitioned) tables produce no rows here
+// (level 0, i.e. the root itself, is excluded) and are handled by the normal path.
+func (c *Publication) setLeafPartitionReplicaIdentities(ctx context.Context) error {
+	for _, t := range c.cfg.Tables {
+		query := fmt.Sprintf(
+			`SELECT n.nspname, cl.relname, cl.relreplident::text
+FROM pg_partition_tree('%s'::regclass) pt
+JOIN pg_class cl ON cl.oid = pt.relid
+JOIN pg_namespace n ON n.oid = cl.relnamespace
+WHERE pt.isleaf AND pt.level > 0`,
+			pgx.Identifier{t.Schema, t.Name}.Sanitize(),
+		)
+
+		resultReader := c.conn.Exec(ctx, query)
+		results, err := resultReader.ReadAll()
+		if err != nil {
+			_ = resultReader.Close()
+			return errors.Wrapf(err, "list leaf partitions of %s.%s", t.Schema, t.Name)
+		}
+		if err = resultReader.Close(); err != nil {
+			return errors.Wrap(err, "leaf partitions result reader close")
+		}
+
+		altered := 0
+		for _, result := range results {
+			for _, row := range result.Rows {
+				if ReplicaIdentityMap[string(row[2])] == t.ReplicaIdentity {
+					continue
+				}
+				leaf := Table{
+					Schema:          string(row[0]),
+					Name:            string(row[1]),
+					ReplicaIdentity: t.ReplicaIdentity,
+				}
+				if err = c.AlterTableReplicaIdentity(ctx, leaf); err != nil {
+					return err
+				}
+				altered++
+			}
+		}
+		if altered > 0 {
+			logger.Info("leaf partition replica identities updated",
+				"table", t.Schema+"."+t.Name,
+				"replica_identity", t.ReplicaIdentity,
+				"altered", altered)
 		}
 	}
 

@@ -12,6 +12,11 @@ type Config struct {
 	Operations        Operations `json:"operations" yaml:"operations"`
 	Tables            Tables     `json:"tables" yaml:"tables"`
 	CreateIfNotExists bool       `json:"createIfNotExists" yaml:"createIfNotExists"`
+	// PublishViaPartitionRoot creates the publication with publish_via_partition_root = true
+	// (PG 13+): changes on partitions are published using the partitioned parent's name and
+	// schema, so Tables only needs to list the parent. Replica identity is still decoded from
+	// the leaf partitions, which SetReplicaIdentities handles by expanding parents to leaves.
+	PublishViaPartitionRoot bool `json:"publishViaPartitionRoot" yaml:"publishViaPartitionRoot"`
 }
 
 func (c Config) Validate() error {
@@ -42,7 +47,11 @@ func (c Config) createQuery() string {
 		quotedTables[i] = fmt.Sprintf("%s.%s", pq.QuoteIdentifier(table.Schema), pq.QuoteIdentifier(table.Name))
 	}
 	sqlStatement += " FOR TABLE " + strings.Join(quotedTables, ", ")
-	sqlStatement += fmt.Sprintf(" WITH (publish = '%s')", c.Operations.String())
+	sqlStatement += fmt.Sprintf(" WITH (publish = '%s'", c.Operations.String())
+	if c.PublishViaPartitionRoot {
+		sqlStatement += ", publish_via_partition_root = true"
+	}
+	sqlStatement += ")"
 	return sqlStatement
 }
 
