@@ -2,6 +2,7 @@ package tuple
 
 import (
 	"encoding/binary"
+	"encoding/json"
 
 	"github.com/go-playground/errors"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -95,6 +96,11 @@ func (d *Data) DecodeWithColumn(columns []RelationColumn) (map[string]any, error
 }
 
 func decodeTextColumnData(data []byte, dataType uint32) (interface{}, error) {
+	// JSON/JSONB 保留原始文本。pgtype 会把 JSON null 解码成 nil，与 SQL NULL 无法区分，
+	// 且数字经 float64 会丢精度。json.RawMessage 对 json.Marshal 和 pgx 编码都是原样透传。
+	if dataType == pgtype.JSONOID || dataType == pgtype.JSONBOID {
+		return json.RawMessage(append([]byte(nil), data...)), nil
+	}
 	if dt, ok := typeMap.TypeForOID(dataType); ok {
 		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.TextFormatCode, data)
 	}

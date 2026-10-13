@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"encoding/json"
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -13,6 +14,11 @@ type TypeDecoder struct {
 
 // Decode decodes column data using the cached decoder
 func (d *TypeDecoder) Decode(typeMap *pgtype.Map, data []byte) (interface{}, error) {
+	// JSON/JSONB 保留原始文本。pgtype 会把 JSON null 解码成 nil，与 SQL NULL 无法区分，
+	// 且数字经 float64 会丢精度。json.RawMessage 对 json.Marshal 和 pgx 编码都是原样透传。
+	if d.oid == pgtype.JSONOID || d.oid == pgtype.JSONBOID {
+		return json.RawMessage(append([]byte(nil), data...)), nil
+	}
 	if dt, ok := typeMap.TypeForOID(d.oid); ok {
 		return dt.Codec.DecodeValue(typeMap, d.oid, pgtype.TextFormatCode, data)
 	}

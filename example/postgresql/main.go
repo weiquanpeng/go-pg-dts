@@ -35,6 +35,7 @@ type Message struct {
 	OldData map[string]interface{} // 旧数据（delete/update）
 	Ack     func() error           // 确认函数
 	Source  string
+	Skip    bool // 只推进 WAL 位置，不产生任何目标端写入
 }
 
 type pendingItem struct {
@@ -46,6 +47,10 @@ type pendingItem struct {
 
 // 主键缓存：表名 -> 主键列名切片
 var primaryKeyCache = sync.Map{}
+
+// targetTable 非空时，所有全量和增量事件都写入这张表，忽略源表名。
+// 用于同实例内的表迁移，例如把 UserChat 的全量 + 增量都灌进分区表 UserChat_New。
+var targetTable string
 
 func main() {
 	var sourceDSN, targetDSN string
@@ -68,7 +73,16 @@ func main() {
 	// 分区表订阅场景（如反向同步）：白名单只需写分区父表，publication 以父表名义发布事件，
 	// 启动时自动把父表下所有叶子分区设为 REPLICA IDENTITY FULL（需源端 PG 13+）
 	flag.BoolVar(&publishViaPartitionRoot, "publish-via-partition-root", false, "以分区父表名义发布 CDC 事件，仅支持 --snapshot=false")
+	// 同实例迁移：所有事件改写到这张表，源表名被忽略。目标表可以是分区表，但它的主键
+	// 必须包含分区键，否则 PG 不接受 upsert 用的 ON CONFLICT 目标。
+	flag.StringVar(&targetTable, "target-table", "", "把所有事件写入这张表（如 UserChat_New），留空则写入与源表同名的表")
 	flag.Parse()
+
+	// 统一补全 schema，让 mapTable 的返回值和主键/列类型缓存的 key 保持一致
+	if targetTable != "" {
+		schema, name := parseSchemaTable(targetTable)
+		targetTable = schema + "." + name
+	}
 
 	if sourceDSN == "" || targetDSN == "" {
 		fmt.Fprintf(os.Stderr, "错误: 必须提供 --source 和 --target 参数\n")
@@ -157,6 +171,7 @@ func main() {
 	}
 
 	loadPublicationTables(ctx, &cfg)
+	validateTargetTable(&cfg)
 	ensureTargetPrimaryKeys(ctx, targetPool, cfg.Publication.Tables)
 
 	// snapshot_only 模式取表走 Snapshot.Tables 分支，与 publication 无关。
@@ -215,21 +230,52 @@ func parseSnapshotFlag(v string) (enabled bool, mode config.SnapshotMode, err er
 	}
 }
 
+// mapTable 返回事件实际写入的目标表名。
+func mapTable(table string) string {
+	if targetTable == "" {
+		return table
+	}
+	return targetTable
+}
+
+// shouldSkipHeartbeat 判断心跳事件是否要在目标端丢弃。
+// 只有开了 --target-table 才丢：那种模式下所有事件都被改写到同一张业务表，心跳行的
+// 列名对不上，写过去必然报错。不带该参数时维持原行为，心跳照常同步到目标库的
+// cdc_heartbeat，可以拿它观察端到端延迟。
+func shouldSkipHeartbeat(schema, name string) bool {
+	return targetTable != "" && config.IsHeartbeatTable(schema, name)
+}
+
+// skipMessage 构造一条不产生 SQL 的占位消息。被丢弃的事件仍要走一遍队列，等排在它
+// 前面的事件落盘后再按顺序 ACK。直接在 handler 里 ACK 会跨过队列中尚未写入的事件，
+// 进程崩溃后复制槽从更靠后的位置续传，这些事件不会重投。
+func skipMessage(ack func() error) Message {
+	return Message{Skip: true, Ack: ack, Source: "cdc"}
+}
+
 // FilteredMapper 将 CDC 事件转换为通用 Message
 func FilteredMapper(messages chan Message) replication.ListenerFunc {
 	return func(ctx *replication.ListenerContext) {
 		switch msg := ctx.Message.(type) {
 		case *format.Insert:
+			if shouldSkipHeartbeat(msg.TableNamespace, msg.TableName) {
+				messages <- skipMessage(ctx.Ack)
+				return
+			}
 			messages <- Message{
-				Table:  msg.TableName,
+				Table:  mapTable(msg.TableName),
 				Action: "insert",
 				Data:   msg.Decoded,
 				Ack:    ctx.Ack,
 				Source: "cdc",
 			}
 		case *format.Update:
+			if shouldSkipHeartbeat(msg.TableNamespace, msg.TableName) {
+				messages <- skipMessage(ctx.Ack)
+				return
+			}
 			messages <- Message{
-				Table:   msg.TableName,
+				Table:   mapTable(msg.TableName),
 				Action:  "update",
 				Data:    msg.NewDecoded,
 				OldData: msg.OldDecoded,
@@ -237,8 +283,12 @@ func FilteredMapper(messages chan Message) replication.ListenerFunc {
 				Source:  "cdc",
 			}
 		case *format.Delete:
+			if shouldSkipHeartbeat(msg.TableNamespace, msg.TableName) {
+				messages <- skipMessage(ctx.Ack)
+				return
+			}
 			messages <- Message{
-				Table:   msg.TableName,
+				Table:   mapTable(msg.TableName),
 				Action:  "delete",
 				OldData: msg.OldDecoded,
 				Ack:     ctx.Ack,
@@ -264,7 +314,7 @@ func handleSnapshot(ctx *replication.ListenerContext, messages chan<- Message) {
 
 	case format.SnapshotEventTypeData:
 		messages <- Message{
-			Table:  msg.Table,
+			Table:  mapTable(msg.Table),
 			Action: "insert", // 快照数据视为插入
 			Data:   msg.Data, // 直接使用 msg.Data，它包含整行字段
 			Ack:    ctx.Ack,  // 重要：直接使用 ctx.Ack 作为确认函数
@@ -339,25 +389,30 @@ func Produce(ctx context.Context, w *pgxpool.Pool, bulkSize int, messages <-chan
 			}
 			lastRecv = time.Now()
 
-			// 根据事件类型构建 SQL
-			sql, args, err := buildSQL(ctx, w, event)
-			if err != nil {
-				slog.Error("构建 SQL 失败，迁移终止",
-					"table", event.Table,
-					"action", event.Action,
-					"source", event.Source,
-					"error", err,
-				)
-				// 不能跳过该事件：后续事件成功 ACK 会跨过当前 WAL 位置，造成永久数据丢失。
-				// continue
-				os.Exit(1)
+			if event.Skip {
+				// 不落库，只占位排队，等轮到它时按顺序 ACK
+				queue = append(queue, pendingItem{ack: event.Ack, source: event.Source})
+			} else {
+				// 根据事件类型构建 SQL
+				sql, args, err := buildSQL(ctx, w, event)
+				if err != nil {
+					slog.Error("构建 SQL 失败，迁移终止",
+						"table", event.Table,
+						"action", event.Action,
+						"source", event.Source,
+						"error", err,
+					)
+					// 不能跳过该事件：后续事件成功 ACK 会跨过当前 WAL 位置，造成永久数据丢失。
+					// continue
+					os.Exit(1)
+				}
+				queue = append(queue, pendingItem{
+					query:  &pgx.QueuedQuery{SQL: sql, Arguments: args},
+					ack:    event.Ack,
+					source: event.Source,
+					msg:    &event, // 新增
+				})
 			}
-			queue = append(queue, pendingItem{
-				query:  &pgx.QueuedQuery{SQL: sql, Arguments: args},
-				ack:    event.Ack,
-				source: event.Source,
-				msg:    &event, // 新增
-			})
 
 			if event.Source == "cdc" && cdcTimer == nil {
 				cdcTimer = time.NewTimer(cdcFlushInterval)
@@ -404,27 +459,40 @@ func flushBatch(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) er
 func flushBatchGeneric(ctx context.Context, conn *pgxpool.Pool, items []pendingItem) error {
 	batch := &pgx.Batch{}
 	for _, it := range items {
+		// 占位消息没有 SQL，只需要在后面参与 ACK
+		if it.query == nil {
+			continue
+		}
 		batch.QueuedQueries = append(batch.QueuedQueries, it.query)
 	}
-	br := conn.SendBatch(ctx, batch)
 
-	for i := 0; i < len(items); i++ {
-		if _, err := br.Exec(); err != nil {
-			_ = br.Close()
-			return fmt.Errorf("第 %d 条 SQL 失败: %w", i, err)
+	if len(batch.QueuedQueries) > 0 {
+		br := conn.SendBatch(ctx, batch)
+
+		for i := range batch.QueuedQueries {
+			if _, err := br.Exec(); err != nil {
+				_ = br.Close()
+				return fmt.Errorf("第 %d 条 SQL 失败: %w", i, err)
+			}
+		}
+
+		// SendBatch 使用隐式事务。必须先 Close 并检查最终协议结果，确认整个目标批次
+		// 成功后才能推进源端 WAL；否则异常退出可能造成源端已 ACK、目标端未落盘。
+		if err := br.Close(); err != nil {
+			return fmt.Errorf("结束批次失败: %w", err)
 		}
 	}
 
-	// SendBatch 使用隐式事务。必须先 Close 并检查最终协议结果，确认整个目标批次
-	// 成功后才能推进源端 WAL；否则异常退出可能造成源端已 ACK、目标端未落盘。
-	if err := br.Close(); err != nil {
-		return fmt.Errorf("结束批次失败: %w", err)
-	}
-
-	for i, it := range items {
-		if err := it.ack(); err != nil {
+	// 位点单调递增，ACK 最后一条 CDC 消息即覆盖整批；逐条 ACK 会在高吞吐时
+	// 向主库 walsender 每秒发送数万次状态报文。快照消息的 ACK 是空实现，跳过。
+	for i := len(items) - 1; i >= 0; i-- {
+		if items[i].source != "cdc" {
+			continue
+		}
+		if err := items[i].ack(); err != nil {
 			return fmt.Errorf("第 %d 条消息 ACK 失败: %w", i, err)
 		}
+		break
 	}
 
 	cdcCount := 0
@@ -828,9 +896,19 @@ func getPrimaryKeys(ctx context.Context, conn *pgxpool.Pool, table string) ([]st
 // 放在启动阶段是因为写入路径依赖主键生成 UPSERT，等跑到那里才报错会先把一部分数据写进去。
 // 一次列出所有缺主键的表，避免一张一张试。
 func ensureTargetPrimaryKeys(ctx context.Context, conn *pgxpool.Pool, tables publication.Tables) {
+	// 开了 --target-table 时写入只落在这一张表上，校验源表名没有意义：
+	// 同实例迁移时源表在目标库里同样存在，逐张校验会全部通过却漏掉真正的目标表。
+	var targets []string
+	if targetTable != "" {
+		targets = []string{targetTable}
+	} else {
+		for _, t := range tables {
+			targets = append(targets, t.Schema+"."+t.Name)
+		}
+	}
+
 	var missing []string
-	for _, t := range tables {
-		full := t.Schema + "." + t.Name
+	for _, full := range targets {
 		if _, err := getPrimaryKeys(ctx, conn, full); err != nil {
 			missing = append(missing, fmt.Sprintf("%s (%v)", full, err))
 		}
@@ -842,7 +920,39 @@ func ensureTargetPrimaryKeys(ctx context.Context, conn *pgxpool.Pool, tables pub
 		}
 		os.Exit(1)
 	}
-	slog.Info("目标库主键校验通过", "tables", len(tables))
+	slog.Info("目标库主键校验通过", "tables", len(targets))
+}
+
+// validateTargetTable 校验 --target-table 的使用方式。
+func validateTargetTable(cfg *config.Config) {
+	if targetTable == "" {
+		return
+	}
+
+	// 同实例迁移时源库就是目标库。目标表一旦被发布，写入它产生的 WAL 会再次变成
+	// CDC 事件写回自己，形成停不下来的自激循环。
+	for _, t := range cfg.Publication.Tables {
+		if t.Schema+"."+t.Name == targetTable {
+			slog.Error("目标表不能同时是被发布的源表，否则会自激循环，请调整 loadPublicationTables 的表清单",
+				"table", targetTable)
+			os.Exit(1)
+		}
+	}
+
+	// 所有事件都改写到同一张表，源端有多张表时数据会被灌到一起
+	if len(cfg.Publication.Tables) > 1 {
+		names := make([]string, 0, len(cfg.Publication.Tables))
+		for _, t := range cfg.Publication.Tables {
+			names = append(names, t.Schema+"."+t.Name)
+		}
+		slog.Error("--target-table 会把所有源表写进同一张表，源端表清单必须只有一张表",
+			"target_table", targetTable, "source_tables", strings.Join(names, ", "))
+		os.Exit(1)
+	}
+
+	slog.Info("目标表检查通过",
+		"source_table", cfg.Publication.Tables[0].Schema+"."+cfg.Publication.Tables[0].Name,
+		"target_table", targetTable)
 }
 
 // parseSchemaTable 将 "schema.table" 拆分为 schema 和 table，默认为 public
@@ -863,7 +973,7 @@ func loadPublicationTables(ctx context.Context, cfg *config.Config) {
 		os.Exit(1)
 	}
 	defer conn.Close(ctx)
-	query := `SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' and table_name in ('PromptImageHistory');`
+	query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND (table_name LIKE 'ConversationNew\_p%' OR table_name = 'ConversationNewDeleted');`
 	pwq_tables := conn.Exec(ctx, query)
 	pwq_results, err := pwq_tables.ReadAll()
 	if err != nil {

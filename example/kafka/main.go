@@ -26,12 +26,25 @@ var (
 	pgPool          *pgxpool.Pool
 	topicPrefix     string
 	primaryKeyCache sync.Map
+	pendingCH       = make(chan pendingMessage, pendingQueueSize)
 )
 
 const (
 	kafkaRetryCount    = 5
 	kafkaRetryInterval = 1 * time.Second
+	// 攒批参数，先到者触发。批次越大吞吐越高，但进程崩溃时重投的消息也越多。
+	flushBatchSize   = 500
+	flushInterval    = 50 * time.Millisecond
+	pendingQueueSize = 4096
 )
+
+// pendingMessage 是批量队列里的一个单元。msg 为 nil 表示该事件不需要写 Kafka
+// （心跳表、Relation 等），但它仍要占一个队列位置：ACK 必须等排在它前面的消息
+// 真正落盘后再按顺序发出，否则会跨过尚未写入的消息推进复制槽位点。
+type pendingMessage struct {
+	msg *kafka.Message
+	ack func() error
+}
 
 func main() {
 	var sourceDSN, kafkaBrokers string
@@ -73,10 +86,12 @@ func main() {
 		Addr:                   kafka.TCP(strings.Split(kafkaBrokers, ",")...),
 		AllowAutoTopicCreation: true,
 		BatchSize:              2000,
-		BatchTimeout:           200 * time.Millisecond,
-		RequiredAcks:           kafka.RequireOne,
-		Balancer:               &kafka.Hash{},
-		Async:                  false,
+		// kafka-go 按分区各自攒批，一次交付的消息散到多个分区后往往填不满
+		// BatchSize，只能等计时器。这里取小值，避免每次刷出都白等一个批次窗口。
+		BatchTimeout: 10 * time.Millisecond,
+		RequiredAcks: kafka.RequireOne,
+		Balancer:     &kafka.Hash{},
+		Async:        false,
 	}
 	defer kafkaWriter.Close()
 	cfg := cdcconfig.Config{
@@ -117,71 +132,122 @@ func main() {
 		os.Exit(1)
 	}
 	defer connector.Close()
+	go flushWorker(ctx)
 	slog.Info("cdc started")
 	connector.Start(ctx)
 }
 
+// Handler 只负责组装消息并入队，不写 Kafka 也不 ACK。逐条同步写会让 kafka-go
+// 每条都空等一次 BatchTimeout，而 process 循环是串行的，吞吐会被压到每秒几条。
 func Handler(ctx *replication.ListenerContext) {
-	var err error
+	var (
+		kafkaMsg *kafka.Message
+		err      error
+	)
 	switch msg := ctx.Message.(type) {
 	case *format.Insert:
 		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
-			err = writeKafkaMessage(context.Background(), msg.TableName, "insert", msg.Decoded)
+			kafkaMsg, err = buildKafkaMessage(context.Background(), msg.TableName, "insert", msg.Decoded)
 		}
 	case *format.Update:
 		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
-			err = writeKafkaMessage(context.Background(), msg.TableName, "update", msg.NewDecoded)
+			kafkaMsg, err = buildKafkaMessage(context.Background(), msg.TableName, "update", msg.NewDecoded)
 		}
 	case *format.Delete:
 		if !cdcconfig.IsHeartbeatTable(msg.TableNamespace, msg.TableName) {
-			err = writeKafkaMessage(context.Background(), msg.TableName, "delete", msg.OldDecoded)
+			kafkaMsg, err = buildKafkaMessage(context.Background(), msg.TableName, "delete", msg.OldDecoded)
 		}
 	}
 	if err != nil {
-		slog.Error("write kafka failed permanently, exiting", "error", err)
+		slog.Error("build kafka message failed, exiting", "error", err)
 		os.Exit(1)
 		return
 	}
-	if err := ctx.Ack(); err != nil {
-		slog.Error("ack failed", "error", err)
+	// 队列满时在此阻塞，背压沿 process 循环一路传导回 walsender。
+	pendingCH <- pendingMessage{msg: kafkaMsg, ack: ctx.Ack}
+}
+
+// flushWorker 把队列里的消息攒成批次写入 Kafka，整批落盘后统一推进复制槽位点。
+func flushWorker(ctx context.Context) {
+	batch := make([]kafka.Message, 0, flushBatchSize)
+	var lastAck func() error
+
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	flush := func() {
+		if lastAck == nil {
+			return
+		}
+		if len(batch) > 0 {
+			if err := writeKafkaBatch(ctx, batch); err != nil {
+				slog.Error("write kafka failed permanently, exiting", "error", err)
+				os.Exit(1)
+			}
+		}
+		// 只 ACK 本批最后一条：消息自 WAL 起每一跳都保持顺序，位点推进又是单调的，
+		// 确认末条即覆盖同批次中排在它之前的全部消息。写失败时不 ACK，整批留给
+		// 进程重启后重新投递。
+		if err := lastAck(); err != nil {
+			slog.Error("ack failed", "error", err)
+		}
+		batch = batch[:0]
+		lastAck = nil
+	}
+
+	for {
+		select {
+		case pending := <-pendingCH:
+			if pending.msg != nil {
+				batch = append(batch, *pending.msg)
+			}
+			lastAck = pending.ack
+			if len(batch) >= flushBatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
 	}
 }
 
-func writeKafkaMessage(ctx context.Context, table, operation string, payload map[string]interface{}) error {
+func buildKafkaMessage(ctx context.Context, table, operation string, payload map[string]interface{}) (*kafka.Message, error) {
 	if payload == nil {
-		return nil
+		return nil, nil
 	}
 	payload = cloneMap(payload)
 	payload["operation"] = operation
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	topic := topicPrefix + "." + table
-	msg := kafka.Message{
-		Topic: topic,
+	return &kafka.Message{
+		Topic: topicPrefix + "." + table,
 		Key:   buildKafkaKey(ctx, table, payload),
 		Value: data,
 		Headers: []kafka.Header{
 			{Key: "table", Value: []byte(table)},
 			{Key: "operation", Value: []byte(operation)},
 		},
-	}
+	}, nil
+}
+
+func writeKafkaBatch(ctx context.Context, batch []kafka.Message) error {
 	var lastErr error
 	for i := 1; i <= kafkaRetryCount; i++ {
-		err = kafkaWriter.WriteMessages(ctx, msg)
+		err := kafkaWriter.WriteMessages(ctx, batch...)
 		if err == nil {
 			return nil
 		}
 		lastErr = err
-		slog.Warn("write kafka failed, retrying", "attempt", i, "max_retry", kafkaRetryCount, "topic", topic, "error", err)
+		slog.Warn("write kafka failed, retrying", "attempt", i, "max_retry", kafkaRetryCount, "size", len(batch), "error", err)
 		time.Sleep(kafkaRetryInterval)
 	}
 	return fmt.Errorf("write kafka failed after %d retries: %v", kafkaRetryCount, lastErr)
 }
 
 func loadTables(ctx context.Context) (publication.Tables, error) {
-	query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name IN ('ConversationNewDeleted')`
+	query := `SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name IN ('PromptI18N')`
 	rows, err := pgPool.Query(ctx, query)
 	if err != nil {
 		return nil, err
